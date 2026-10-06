@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Saturn Control</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='9' fill='%2338bdf8'/%3E%3Cellipse cx='16' cy='16' rx='15' ry='4' fill='none' stroke='%23e2e8f0' stroke-width='2'/%3E%3C/svg%3E">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo"></span><span id="printerName">Saturn Control</span></div>
+  <div class="hdr-status">
+    <span id="connDot" class="dot off"></span><span id="connText">Connecting…</span>
+    <span id="stateChip" class="chip">–</span>
+  </div>
+  <div class="hdr-actions">
+    <button id="btnLight" class="btn" title="Toggle light">💡 Light</button>
+    <button id="btnRefreshAll" class="btn icon" title="Refresh status">⟳</button>
+    <button id="btnSettings" class="btn icon" title="App settings (printer IP)">⚙</button>
+  </div>
+</header>
+
+<div id="banner" class="banner hidden"></div>
+
+<main>
+  <section class="col left">
+    <div class="card" id="camCard">
+      <div class="card-h">
+        <h2>Camera</h2>
+        <div class="spacer"></div>
+        <button class="btn sm" id="camToggle">Start</button>
+        <button class="btn sm" id="camSnap" title="Save a snapshot">📷</button>
+        <button class="btn sm" id="camFull" title="Fullscreen">⛶</button>
+      </div>
+      <div class="cam" id="camBox">
+        <img id="camImg" alt="" hidden>
+        <div id="camMsg" class="cam-msg">Camera is off. Press Start.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>Print</h2><div class="spacer"></div><span id="printStatus" class="chip">Idle</span></div>
+      <div class="job" id="jobBox">
+        <div class="job-file" id="jobFile">No active print</div>
+        <div class="bar"><div id="jobBar" style="width:0%"></div><span id="jobPct">0%</span></div>
+        <div class="stats">
+          <div><label>Layer</label><b id="sLayer">–</b></div>
+          <div><label>Elapsed</label><b id="sElapsed">–</b></div>
+          <div><label>Remaining</label><b id="sRemain">–</b></div>
+          <div><label>ETA</label><b id="sEta">–</b></div>
+        </div>
+        <div class="controls">
+          <button class="btn" id="bPause">⏸ Pause</button>
+          <button class="btn" id="bResume">▶ Resume</button>
+          <button class="btn danger" id="bStop">⏹ Stop</button>
+          <button class="btn" id="bSkip" title="Skip preheating">⏭ Skip preheat</button>
+        </div>
+        <div id="jobError" class="err hidden"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-h"><h2>Machine</h2></div>
+      <div class="stats two" id="machineStats"></div>
+    </div>
+  </section>
+
+  <section class="col right">
+    <nav class="tabs" id="tabs">
+      <button data-tab="files" class="active">Files</button>
+      <button data-tab="history">History</button>
+      <button data-tab="printer">Printer</button>
+      <button data-tab="explorer">Explorer</button>
+    </nav>
+
+    <!-- FILES -->
+    <div class="tab" id="tab-files">
+      <div class="card">
+        <div class="card-h wrap">
+          <div class="seg" id="storageSeg">
+            <button data-root="/local/" class="active">Internal</button>
+            <button data-root="/usb/">USB</button>
+          </div>
+          <div class="crumbs" id="crumbs"></div>
+          <div class="spacer"></div>
+          <input id="fileFilter" class="input sm" placeholder="Filter…">
+          <button class="btn sm" id="btnDeleteSel" disabled>🗑 Delete selected</button>
+          <button class="btn sm" id="btnUpload">⬆ Upload</button>
+          <button class="btn sm" id="btnRefresh">⟳ Refresh</button>
+          <button class="btn sm" id="btnRawFiles" title="Copy the printer's raw file list reply, for troubleshooting">{ } Raw</button>
+          <input type="file" id="fileInput" accept=".ctb,.cbddlp,.goo,.photon,.pwmx,.zip,*" hidden multiple>
+        </div>
+        <div id="storageBar" class="storage hidden"><div id="storageFill"></div><span id="storageText"></span></div>
+        <div id="uploadBox" class="upload hidden">
+          <div class="up-row"><b id="upName"></b><span id="upPhase"></span><button class="btn sm danger" id="upCancel">Cancel</button></div>
+          <div class="bar"><div id="upBar" style="width:0%"></div><span id="upPct"></span></div>
+        </div>
+        <div id="dropzone" class="dropzone">Drop files here to upload to this printer</div>
+        <div id="fileList" class="files"></div>
+      </div>
+    </div>
+
+    <!-- HISTORY -->
+    <div class="tab hidden" id="tab-history">
+      <div class="card">
+        <div class="card-h"><h2>Print history</h2><div class="spacer"></div><button class="btn sm" id="btnHistory">⟳ Refresh</button></div>
+        <div id="historyList" class="files"></div>
+      </div>
+    </div>
+
+    <!-- PRINTER -->
+    <div class="tab hidden" id="tab-printer">
+      <div class="card">
+        <div class="card-h"><h2>Settings</h2></div>
+        <div class="form">
+          <label>Printer name</label>
+          <div class="row"><input class="input" id="inName"><button class="btn" id="btnRename">Rename</button></div>
+          <label>Time-lapse photography</label>
+          <div class="row"><label class="switch"><input type="checkbox" id="tlSwitch"><span></span></label><span class="muted">Printer records a time-lapse of each print</span></div>
+          <label class="lightRow">Light</label>
+          <div class="row lightRow"><button class="btn" id="lightOn">Turn on</button><button class="btn" id="lightOff">Turn off</button><span class="muted" id="lightNote"></span></div>
+          <label>Find printers on the network</label>
+          <div class="row"><button class="btn" id="btnDiscover">Scan (UDP)</button><span class="muted" id="discoverOut"></span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>Advanced</h2></div>
+        <div class="form">
+          <label>Stop auto-feeding</label>
+          <div class="row"><button class="btn" id="bFeed">Stop feeding</button><span class="muted">Only for Elegoo's automatic resin feeder accessory (tops up the vat from a bottle). Does nothing on a normal printer without it.</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>Hardware self-check</h2></div>
+        <div class="stats two" id="deviceStats"></div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>Printer information</h2></div>
+        <div class="stats two" id="attrStats"></div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>Recent printer messages</h2></div>
+        <div id="msgList" class="msgs"></div>
+      </div>
+    </div>
+
+
+    <!-- EXPLORER -->
+    <div class="tab hidden" id="tab-explorer">
+      <div class="card">
+        <div class="card-h wrap"><h2>Printer file explorer</h2><div class="spacer"></div><button class="btn sm" id="exReport">Copy report</button></div>
+        <div class="form">
+          <div class="muted">Browses whatever the printer will list for a path and shows its raw reply. Nothing here changes anything on the printer.</div>
+          <div class="row">
+            <button class="btn sm" id="exUp">⬆ Up</button>
+            <input class="input grow mono" id="exPath" value="/local/">
+            <button class="btn" id="exGo">Go</button>
+          </div>
+          <div class="row" id="exQuick"></div>
+          <div id="exList" class="files"></div>
+          <label>Raw reply</label>
+          <pre id="exRaw" class="mono out"></pre>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>HTTP probe</h2></div>
+        <div class="form">
+          <div class="muted">Browses the printer's web server (port 80 is where thumbnails live, e.g. /board-resource/history_image/). Directory listings show clickable links; files show their first bytes.</div>
+          <div class="row">
+            <select class="input" id="prPort"><option>80</option><option>3030</option><option>3031</option><option>8080</option></select>
+            <input class="input grow mono" id="prPath" value="/board-resource/">
+            <button class="btn" id="prGo">Probe</button>
+          </div>
+          <div class="row" id="prLinks"></div>
+          <pre id="prOut" class="mono out"></pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<section class="card console" id="console">
+  <div class="card-h wrap">
+    <h2>Console</h2>
+    <label class="chk"><input type="checkbox" id="lgStatus"> status updates</label>
+    <label class="chk"><input type="checkbox" id="lgDebug"> upload chunks</label>
+    <label class="chk"><input type="checkbox" id="lgRaw"> raw JSON</label>
+    <div class="spacer"></div>
+    <button class="btn sm" id="lgCopy">Copy</button>
+    <button class="btn sm" id="lgSave">Save</button>
+    <button class="btn sm" id="lgClear">Clear</button>
+  </div>
+  <div id="logView" class="logview mono"></div>
+  <div class="logcmd">
+    <input class="input grow mono" id="rawLine" placeholder='Send raw command, e.g.  258 {"Url":"/local/"}   or   0' autocomplete="off">
+    <button class="btn" id="rawSend">Send</button>
+  </div>
+</section>
+
+<dialog id="dlg"><form method="dialog"><div id="dlgBody"></div><menu><button class="btn" value="cancel">Cancel</button><button class="btn primary" value="ok" id="dlgOk">OK</button></menu></form></dialog>
+<div id="toasts"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "printer_ip": "192.168.0.189",
+
+  "printer_port": 3030,
+  "video_port": 3031,
+  "udp_port": 3000,
+  "mainboard_id": "",
+
+  "web_host": "127.0.0.1",
+  "web_port": 8080,
+  "open_browser": true,
+
+  "light_enabled": false,
+  "light": {
+    "cmd": 403,
+    "on":  { "LightStatus": { "SecondLight": true, "RgbLight": [0, 0, 0] } },
+    "off": { "LightStatus": { "SecondLight": false, "RgbLight": [0, 0, 0] } }
+  }
+}
