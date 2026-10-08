@@ -9,6 +9,7 @@ A local web UI (Fluidd-style) for an Elegoo Saturn 4 Ultra, using Elegoo's SDCP 
 
 ## Config (`config.json`)
 - `printer_ip` - **the one place the printer IP lives** (192.168.0.189).
+- `auto_exit` - `true` (default): the app quits by itself a few seconds after you close the browser tab (never mid-upload), and the launcher window closes. Set `false` to keep it running.
 - `web_host` - `127.0.0.1` = this PC only. Use `0.0.0.0` to open it from your phone/other PCs on the LAN (no password, so LAN only).
 - `web_port`, `printer_port` (3030), `video_port` (3031), `udp_port` (3000), `mainboard_id` (auto-detected).
 - `light` - the command sent by the light button (see caveat below).

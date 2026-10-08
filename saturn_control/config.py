@@ -14,6 +14,8 @@ DEFAULTS = {
     "web_host": "127.0.0.1",
     "web_port": 8080,
     "open_browser": True,
+    "auto_exit": True,
+    "auto_exit_seconds": 10,
     "light_enabled": False,
     "light": {
         "cmd": 403,

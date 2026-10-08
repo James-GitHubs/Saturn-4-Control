@@ -97,6 +97,10 @@ def create_app(cfg=None):
     async def ws_handler(request):
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
+        t = app.get("exit_task")
+        if t:
+            t.cancel()
+            app["exit_task"] = None
         try:
             await ws.send_json({"type": "state", "state": printer().public_state()})
             await ws.send_json({"type": "log_init", "entries": list(printer().log)[-300:]})
@@ -105,7 +109,24 @@ def create_app(cfg=None):
                 pass
         finally:
             app["clients"].discard(ws)
+            if not app["clients"] and cfg.get("auto_exit", True):
+                app["exit_task"] = asyncio.create_task(exit_when_idle())
         return ws
+
+    async def exit_when_idle():
+        """Last browser tab closed: wait a few seconds (page reloads reconnect), then quit the app."""
+        await asyncio.sleep(float(cfg.get("auto_exit_seconds", 10)))
+        while app["clients"] == set():
+            up = printer().upload
+            if up and up.get("phase") in ("sending", "verifying"):
+                await asyncio.sleep(2)       # never quit in the middle of an upload
+                continue
+            printer().note("Browser closed - shutting down")
+            asyncio.get_running_loop().call_soon(_raise_exit)
+            return
+
+    def _raise_exit():
+        raise web.GracefulExit()
 
     async def broadcaster():
         while True:

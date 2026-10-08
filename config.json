@@ -9,6 +9,7 @@
   "web_host": "127.0.0.1",
   "web_port": 8080,
   "open_browser": true,
+  "auto_exit": true,
 
   "light_enabled": false,
   "light": {

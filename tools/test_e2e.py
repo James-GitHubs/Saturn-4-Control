@@ -36,7 +36,7 @@ async def wait_for(fn, timeout=15, step=0.2):
 
 async def main(minimal=False):
     cfgfile = os.path.join(tempfile.mkdtemp(), "config.json")
-    open(cfgfile, "w").write('{"open_browser": false}')
+    open(cfgfile, "w").write('{"open_browser": false, "auto_exit": false}')
     env = dict(os.environ, SATURN_IP="127.0.0.1", SATURN_PORT=str(PORTS["printer"]),
                SATURN_VIDEO_PORT=str(PORTS["video"]), SATURN_UDP_PORT=str(PORTS["udp"]),
                SATURN_WEB_PORT=str(PORTS["web"]), SATURN_CONFIG=cfgfile)

@@ -29,6 +29,9 @@ if errorlevel 1 (
 
 rem ---- run (the app opens your browser itself) ----
 ".venv\Scripts\python.exe" -m saturn_control
-echo.
-echo Server stopped.
-pause
+rem Closing the browser tab stops the app and this window closes by itself. Only stay open on an error.
+if errorlevel 1 (
+  echo.
+  echo The app stopped with an error.
+  pause
+)
