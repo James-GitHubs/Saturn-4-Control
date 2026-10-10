@@ -7,13 +7,15 @@ import re
 import shutil
 import tempfile
 import time
+from collections import OrderedDict
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
 from aiohttp import web
 
 from .config import ROOT, load_config
+from .httpfs import has_percent_codes, is_virtual, looks_like_fragment, normalize_dir, parse_listing
 from .printer import CMD, PrinterClient, PrinterError, _num, discover, pick
 
 STATIC = Path(__file__).parent / "static"
@@ -31,6 +33,29 @@ def ffmpeg_path():
         return None
 
 
+async def stop_ffmpeg(proc, grace=3.0):
+    """Stop ffmpeg politely: 'q' on stdin makes it send the RTSP TEARDOWN, which frees the printer's
+    camera slot. A hard kill() skips that and leaves the slot occupied until the printer times it out."""
+    if proc.returncode is not None:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.write(b"q")
+            await proc.stdin.drain()
+    except Exception:  # noqa: BLE001
+        pass
+    for sig, wait in (("q", grace), ("terminate", 2.0), ("kill", 2.0)):
+        if sig == "terminate":
+            proc.terminate()
+        elif sig == "kill":
+            proc.kill()
+        try:
+            await asyncio.wait_for(proc.wait(), wait)
+            return
+        except asyncio.TimeoutError:
+            continue
+
+
 def jerr(msg, status=400, **extra):
     return web.json_response({"ok": False, "message": msg, **extra}, status=status)
 
@@ -41,6 +66,7 @@ def create_app(cfg=None):
     app["cfg"] = cfg
     app["clients"] = set()
     app["logq"] = []
+    app["imgcache"] = OrderedDict()
     app["dirty"] = None  # asyncio.Event, created in on_startup
 
     routes = web.RouteTableDef()
@@ -68,7 +94,6 @@ def create_app(cfg=None):
     async def get_config(request):
         return web.json_response({"printer_ip": cfg["printer_ip"], "printer_port": cfg["printer_port"],
                                   "video_port": cfg["video_port"],
-                                  "light_cmd": cfg["light"]["cmd"],
                                   "light_enabled": bool(cfg.get("light_enabled"))})
 
     @routes.post("/api/settings")
@@ -206,26 +231,54 @@ def create_app(cfg=None):
     async def light(request):
         b = await request.json()
         on = bool(b.get("on"))
-        lc = cfg["light"]
-        try:
-            ok, ack, msg, d = await printer().command(lc["cmd"], lc["on" if on else "off"])
-        except PrinterError as e:
-            return jerr(str(e) + " - the light command is not part of the public SDCP spec; "
-                        "see 'light' in config.json", 502)
+        p = printer()
+        if not p.connected:
+            return jerr("Not connected to the printer", 502)
+        results = await p.light_test(on)
+        answered = [r for r in results if r["answered"]]
+        ok = any(r["ack"] == 0 for r in answered)
         if ok:
-            printer().light = on
-            printer().on_change()
-        return web.json_response({"ok": ok, "ack": ack, "light": printer().light,
-                                  "message": msg if not ok else "OK"})
+            msg = "OK"
+        elif answered:
+            msg = f"The printer answered but refused (Ack {answered[0]['ack']})"
+        else:
+            msg = ("The printer ignored the light command. Over the local network it probably does not "
+                   "accept it (the Matrix app sends it through Elegoo's cloud channel).")
+        return web.json_response({"ok": ok, "light": p.light, "results": results, "message": msg})
+
+    @routes.post("/api/print-params")
+    async def print_params(request):
+        b = await request.json()
+        params = {k: v for k, v in (b.get("params") or {}).items()
+                  if k in ("NormalExposureTime", "BottomExposureTime", "BottomLayer", "TransitionLayer",
+                           "LightOffTime", "BottomRestTimeAfterDrop", "NormalRestTimeAfterDrop",
+                           "BottomResetTimeBeforeLift", "NormalResetTimeBeforeLift")}
+        if not params:
+            return jerr("no parameters given")
+        if not printer().connected:
+            return jerr("Not connected to the printer", 502)
+        results = await printer().set_print_params(params)
+        ok = all(r.get("answered") and r.get("ack") == 0 for r in results)
+        if ok:
+            msg = "OK"
+        elif not any(r.get("answered") for r in results):
+            msg = "The printer ignored the change (it may only accept it from the Matrix app)."
+        else:
+            msg = "The printer refused at least one change."
+        return web.json_response({"ok": ok, "results": results, "message": msg})
 
     @routes.post("/api/raw")
     async def raw(request):
+        """Send exactly the text given, unchanged. Nothing is parsed or rejected."""
         b = await request.json()
+        text = b.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return jerr("nothing to send")
         try:
-            d = await printer().request(int(b["cmd"]), b.get("data") or {}, timeout=float(b.get("timeout") or 10))
-        except (PrinterError, KeyError, ValueError) as e:
+            r = await printer().send_raw(text, wait=float(b.get("wait") or 6))
+        except PrinterError as e:
             return jerr(str(e), 502)
-        return web.json_response({"ok": True, "data": d})
+        return web.json_response({"ok": True, **r})
 
     @routes.get("/api/log")
     async def log(request):
@@ -286,45 +339,41 @@ def create_app(cfg=None):
         except PrinterError as e:
             return jerr(str(e), 502)
         items.sort(key=lambda f: (not f["is_dir"], f["name"].lower()))
+        info = await printer().file_info()
+        for f in items:
+            if f["is_dir"]:
+                continue
+            f["fragment"] = looks_like_fragment(f["name"])
+            f["percent_codes"] = has_percent_codes(f["name"])
+            e = info.get(f["name"])
+            if e and not f["fragment"]:
+                for k in ("layer_height", "layers", "est_seconds", "size", "create_time", "thumbnail"):
+                    if e.get(k) is not None:
+                        f[k] = e[k]
+                f["info_source"] = "file_info"
         await annotate_from_history(items)
         return web.json_response({"ok": True, "path": path, "files": items, "storage": storage})
 
-    @routes.get("/api/explore")
-    async def explore(request):
-        """Raw directory listing for any path (diagnostics): returns the printer's full reply."""
-        path = request.query.get("path", "/")
+    @routes.get("/api/http/list")
+    async def http_list(request):
+        """Directory listing of the printer's HTTP file server (read-only), parsed to JSON."""
+        p = printer()
+        path = normalize_dir(request.query.get("path") or "/")
+        url = f"http://{p.ip}:{p.port}{quote(path, safe='/')}"
         try:
-            d = await printer().request(CMD["FILES"], {"Url": path}, timeout=20)
-        except PrinterError as e:
-            return jerr(str(e), 502)
-        return web.json_response({"ok": d.get("Ack", 0) == 0, "path": path, "reply": d})
-
-    @routes.get("/api/probe")
-    async def probe(request):
-        """GET a path on the printer's HTTP server: first bytes, text, and links (to browse listings)."""
-        try:
-            port = int(request.query.get("port", printer().port))
-        except ValueError:
-            return jerr("bad port")
-        path = request.query.get("path", "/")
-        if not path.startswith("/"):
-            path = "/" + path
-        url = f"http://{printer().ip}:{port}{quote(path, safe='/%')}"
-        try:
-            async with printer().session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                body = await r.content.read(65536)
-                ctype = r.headers.get("Content-Type", "")
-                texty = ("text" in ctype or "json" in ctype or "html" in ctype or
-                         all(c in b"\r\n\t" or 32 <= c < 127 for c in body[:200]))
-                text = body.decode("utf-8", "replace") if texty else ""
-                links = re.findall(r'href=["\']([^"\'#?]+)["\']', text) if texty else []
-                return web.json_response({
-                    "ok": True, "url": url, "status": r.status, "content_type": ctype,
-                    "content_length": r.headers.get("Content-Length"),
-                    "headers": dict(r.headers), "hex": body[:64].hex(" "),
-                    "text": text[:6000], "links": links[:300]})
+            async with p.session.get(url, timeout=aiohttp.ClientTimeout(total=25)) as r:
+                if r.status != 200:
+                    return jerr(f"The printer's web server answered HTTP {r.status} for {path}", 404 if r.status == 404 else 502)
+                page = (await r.read()).decode("utf-8", "replace")
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            return web.json_response({"ok": False, "url": url, "message": f"{type(e).__name__}: {e}"})
+            return jerr(f"Could not read {path}: {type(e).__name__}: {e}", 502)
+        entries = parse_listing(page)
+        for e in entries:
+            e["path"] = path + e["name"] + ("/" if e["is_dir"] else "")
+            e["readable"] = e["is_dir"] or not is_virtual(e["path"])
+        return web.json_response({"ok": True, "path": path, "entries": entries,
+                                  "virtual": is_virtual(path),
+                                  "note": None if entries or "Index of" in page else "Not a directory listing"})
 
     @routes.post("/api/files/delete")
     async def delete(request):
@@ -416,40 +465,80 @@ def create_app(cfg=None):
         return jerr("No upload running", 409)
 
     # ---------------------------------------------------------------- proxying printer-hosted resources
-    def printer_url(u):
-        """Resolve u to an absolute URL on the printer, refusing anything else."""
+    IMG_EXT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
+
+    def printer_urls(u):
+        """Candidate absolute URLs on the printer for u, or [] if u points anywhere else.
+        A path starting with '/' is a real (decoded) file path, so it is percent-encoded here; if that
+        404s and the path contains '%', the raw text is tried too (names with literal %20 in them)."""
         p = printer()
         if u.startswith("/"):
-            return f"http://{p.ip}:{p.port}{u}"
+            base = f"http://{p.ip}:{p.port}"
+            out = [base + quote(u, safe="/")]
+            if "%" in u:
+                out.append(base + u)
+            return out
         pu = urlparse(u)
         if pu.scheme in ("http", "https") and pu.hostname == p.ip:
-            return u
-        return None
+            return [u]
+        return []
+
+    def cache_put(key, body, ctype):
+        c = app["imgcache"]
+        c[key] = (body, ctype)
+        c.move_to_end(key)
+        while len(c) > 300:
+            c.popitem(last=False)
 
     @routes.get("/api/fetch")
     async def fetch(request):
-        url = printer_url(request.query.get("u", ""))
-        if not url:
+        cands = printer_urls(request.query.get("u", ""))
+        if not cands:
             return jerr("Only printer-hosted URLs may be fetched", 403)
+        path = unquote(urlparse(cands[0]).path)
+        if is_virtual(path):
+            return jerr("Reading virtual system files (/proc, /sys, /dev) is blocked: they can hang the printer", 403)
+        download = bool(request.query.get("download"))
+        is_img = path.lower().endswith(IMG_EXT) and not download
+        if is_img and "Range" not in request.headers:
+            hit = app["imgcache"].get(cands[0])
+            if hit:
+                return web.Response(body=hit[0], content_type=hit[1], headers={"Cache-Control": "max-age=3600"})
         headers = {}
         if "Range" in request.headers:
             headers["Range"] = request.headers["Range"]
-        try:
-            async with printer().session.get(url, headers=headers,
-                                             timeout=aiohttp.ClientTimeout(total=None, sock_connect=8, sock_read=30)) as r:
-                resp = web.StreamResponse(status=r.status)
-                for h in ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"):
-                    if h in r.headers:
-                        resp.headers[h] = r.headers[h]
-                resp.headers["Cache-Control"] = "max-age=300"
-                if request.query.get("download"):
-                    resp.headers["Content-Disposition"] = 'attachment; filename="%s"' % os.path.basename(urlparse(url).path)
-                await resp.prepare(request)
-                async for chunk in r.content.iter_chunked(64 * 1024):
-                    await resp.write(chunk)
-                return resp
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            return jerr(f"Printer fetch failed: {e}", 502)
+        last_err = None
+        for url in cands:
+            try:
+                async with printer().session.get(
+                        url, headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=None, sock_connect=8, sock_read=60)) as r:
+                    if r.status == 404 and url != cands[-1]:
+                        continue
+                    ctype = r.headers.get("Content-Type", "application/octet-stream").split(";")[0].strip()
+                    if path.lower().endswith(".bmp") and r.status == 200:
+                        ctype = "image/bmp"          # the printer serves BMP thumbnails as octet-stream
+                    if is_img and r.status == 200:
+                        body = await r.read()
+                        cache_put(cands[0], body, ctype)
+                        return web.Response(body=body, content_type=ctype, headers={"Cache-Control": "max-age=3600"})
+                    resp = web.StreamResponse(status=r.status)
+                    resp.headers["Content-Type"] = ctype
+                    for h in ("Content-Length", "Content-Range", "Accept-Ranges"):
+                        if h in r.headers:
+                            resp.headers[h] = r.headers[h]
+                    resp.headers["Cache-Control"] = "max-age=300"
+                    if download:
+                        base = os.path.basename(path) or "download"
+                        ascii_name = base.encode("ascii", "replace").decode().replace('"', "'").replace("?", "_")
+                        resp.headers["Content-Disposition"] = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(base)}"
+                    await resp.prepare(request)
+                    async for chunk in r.content.iter_chunked(64 * 1024):
+                        await resp.write(chunk)
+                    return resp
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_err = e
+        return jerr(f"Printer fetch failed: {last_err}", 502)
 
     # ---------------------------------------------------------------- camera
     # The printer allows very few simultaneous camera clients, so one upstream reader
@@ -469,6 +558,7 @@ def create_app(cfg=None):
                     ff, "-hide_banner", "-loglevel", "warning", *extra,
                     "-rtsp_transport", transport, "-i", url,
                     "-an", "-r", "10", "-q:v", "5", "-f", "mpjpeg", "-",
+                    stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 got = False
                 try:
@@ -481,7 +571,7 @@ def create_app(cfg=None):
                 except asyncio.TimeoutError:
                     errors.append(f"{transport}: no data for 20 s")
                 finally:
-                    proc.kill()
+                    await asyncio.shield(stop_ffmpeg(proc))      # graceful: sends RTSP TEARDOWN
                 err = (await proc.stderr.read()).decode("utf-8", "replace").strip()
                 msg = f"ffmpeg ({transport}) ended: " + (err[-600:] or "no error output")
                 printer().note(msg, "error")
@@ -537,15 +627,23 @@ def create_app(cfg=None):
         p = printer()
         ok, msg, url = await p.enable_video(True)
         if not ok and "maximum number of clients" in msg:
-            # Often a slot left over from an earlier attempt of ours: release it and retry once.
+            # Release anything of ours that is still registered, give the printer a moment, retry once.
             p.note("Camera slot busy: releasing and retrying once", "error")
             try:
                 await p.enable_video(False)
             except Exception:  # noqa: BLE001
                 pass
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
             ok, msg, url = await p.enable_video(True)
         if not ok:
+            try:
+                await p.request(CMD["ATTRIBUTES"], timeout=4, quiet=True)
+            except PrinterError:
+                pass
+            cs = p.camera_slots()
+            if cs and cs["used"] >= cs["max"]:
+                msg = (f"The printer says {cs['used']} of {cs['max']} camera slots are in use. "
+                       "Close the live camera in the Matrix app / Lychee (or press Release camera) and try again.")
             raise PrinterError(msg)
         return url or p.default_video_url()
 
@@ -604,6 +702,26 @@ def create_app(cfg=None):
         finally:
             await hub_release()
 
+    @routes.post("/api/camera/release")
+    async def camera_release(request):
+        """Drop our stream (stops ffmpeg politely) and tell the printer we are done with the camera."""
+        t = hub["task"]
+        if hub["off"]:
+            hub["off"].cancel()
+            hub["off"] = None
+        if t:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        try:
+            await printer().enable_video(False)
+            await printer().request(CMD["ATTRIBUTES"], timeout=4, quiet=True)
+        except PrinterError as e:
+            return jerr(str(e), 502)
+        return web.json_response({"ok": True, "camera": printer().camera_slots()})
+
     @routes.get("/snapshot.jpg")
     async def snapshot(request):
         await hub_acquire()
@@ -634,6 +752,17 @@ def create_app(cfg=None):
 
     async def on_cleanup(app_):
         app["bcast"].cancel()
+        t = hub["task"]
+        if t:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        try:      # leave no camera slot behind on the printer
+            await asyncio.wait_for(app["printer"].enable_video(False), 3)
+        except Exception:  # noqa: BLE001
+            pass
         await app["printer"].stop()
 
     app.router.add_routes(routes)

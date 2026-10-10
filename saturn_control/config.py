@@ -16,12 +16,9 @@ DEFAULTS = {
     "open_browser": True,
     "auto_exit": True,
     "auto_exit_seconds": 10,
-    "light_enabled": False,
-    "light": {
-        "cmd": 403,
-        "on": {"LightStatus": {"SecondLight": True, "RgbLight": [0, 0, 0]}},
-        "off": {"LightStatus": {"SecondLight": False, "RgbLight": [0, 0, 0]}},
-    },
+    "light_enabled": False,          # show the light button in the header (see the Printer tab's light test)
+    "keepalive_seconds": 12,         # how often the app polls the printer to prove the link is alive
+    "keepalive_timeout": 8,
 }
 
 ENV_MAP = {

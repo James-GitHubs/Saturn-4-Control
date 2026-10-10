@@ -112,3 +112,39 @@ dialog menu{display:flex;justify-content:flex-end;gap:8px;padding:0;margin:18px 
 .logview pre{margin:2px 0 4px 18px;color:var(--muted);white-space:pre-wrap;font:inherit}
 .logcmd{display:flex;gap:8px;padding:8px 12px;border-top:1px solid var(--line)}
 .logview .other{color:#fbbf24;font-weight:600}.logview .change{color:#34d399}
+
+.fragbar{margin:8px 14px 0}
+.badge{display:inline-block;padding:0 7px;border-radius:99px;font-size:11px;font-weight:600;border:1px solid var(--line);background:var(--panel2);color:var(--muted);margin-left:6px;vertical-align:middle}
+.badge.warn{background:#713f12;border-color:#a16207;color:#fde68a}
+.badge.bad{background:#7f1d1d;border-color:#b91c1c;color:#fecaca}
+.chip.warn{background:#713f12;border-color:#a16207}
+.ex-bar{padding:8px 14px;border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.ex-quick{display:flex;flex-wrap:wrap;gap:6px}
+.ex-wrap{display:grid;grid-template-columns:minmax(150px,230px) 1fr;min-height:360px}
+@media(max-width:700px){.ex-wrap{grid-template-columns:1fr}.ex-tree{max-height:200px}}
+.ex-tree{border-right:1px solid var(--line);padding:6px 4px;overflow:auto;max-height:640px;font-size:13px}
+.ex-tree .tn{display:flex;align-items:center;gap:2px;padding:2px 4px;border-radius:5px;cursor:pointer;white-space:nowrap}
+.ex-tree .tn:hover{background:var(--panel2)}
+.ex-tree .tn.cur{background:#0c4a6e}
+.ex-tree .tw{width:16px;text-align:center;color:var(--muted);flex:none}
+.ex-tree .tkids{margin-left:14px}
+.ex-main{min-width:0}
+.ex-head,.ex-row{display:grid;grid-template-columns:minmax(120px,1fr) 150px 80px 86px;gap:10px;align-items:center;padding:6px 12px}
+.ex-head{border-bottom:1px solid var(--line);color:var(--muted);font-size:12px}
+.ex-head span[data-sort]{cursor:pointer}
+.ex-head span.sorted:after{content:" ▾"}.ex-head span.sorted.asc:after{content:" ▴"}
+.ex-row{border-top:1px solid var(--line)}
+.ex-row:first-child{border-top:0}
+.ex-row:hover{background:var(--panel2)}
+.ex-name{word-break:break-all}
+.ex-name.dir{color:var(--accent);cursor:pointer;font-weight:600}
+.ex-row .num{text-align:right;color:var(--muted);font-size:12px}
+.ex-row .when{color:var(--muted);font-size:12px}
+.ex-act{display:flex;gap:4px;justify-content:flex-end}
+.ex-info{padding:8px 12px;font-size:12px}
+.ex-list{max-height:640px;overflow:auto}
+@media(max-width:700px){.ex-head,.ex-row{grid-template-columns:1fr 70px 80px}.ex-head span:nth-child(2),.ex-row .when{display:none}}
+.viewer{width:min(900px,92vw);max-width:none}
+.viewer pre{max-height:60vh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
+.logcmd textarea{resize:vertical;min-height:38px}
+.logcmd select{max-width:170px}

@@ -4,6 +4,7 @@
 """
 import asyncio
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -12,6 +13,7 @@ import time
 from pathlib import Path
 
 import aiohttp
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 ROOT = Path(__file__).resolve().parent.parent
 PORTS = dict(printer=13030, video=13031, udp=13000, web=18080)
@@ -36,12 +38,12 @@ async def wait_for(fn, timeout=15, step=0.2):
 
 async def main(minimal=False):
     cfgfile = os.path.join(tempfile.mkdtemp(), "config.json")
-    open(cfgfile, "w").write('{"open_browser": false, "auto_exit": false}')
+    open(cfgfile, "w").write('{"open_browser": false, "auto_exit": false, "keepalive_seconds": 1.5, "keepalive_timeout": 2}')
     env = dict(os.environ, SATURN_IP="127.0.0.1", SATURN_PORT=str(PORTS["printer"]),
                SATURN_VIDEO_PORT=str(PORTS["video"]), SATURN_UDP_PORT=str(PORTS["udp"]),
                SATURN_WEB_PORT=str(PORTS["web"]), SATURN_CONFIG=cfgfile)
     mock_args = [sys.executable, str(ROOT / "tools/mock_printer.py"), "--port", str(PORTS["printer"]),
-                 "--video-port", str(PORTS["video"]), "--udp-port", str(PORTS["udp"])]
+                 "--video-port", str(PORTS["video"]), "--udp-port", str(PORTS["udp"]), "--idle-kill", "4"]
     if minimal:
         mock_args.append("--minimal")
     mock = subprocess.Popen(mock_args)
@@ -56,6 +58,10 @@ async def main(minimal=False):
             async def post(p, body=None):
                 async with s.post(BASE + p, json=body or {}) as r:
                     return await r.json()
+
+            async def post_raw(p, body):
+                async with s.post(BASE.replace(str(PORTS["web"]), str(PORTS["printer"])) + p, json=body) as r:
+                    return r.status, await r.json()
 
             async def connected():
                 try:
@@ -73,15 +79,20 @@ async def main(minimal=False):
             _, j = await get("/api/files?path=/local/")
             names = [f["name"] for f in j["files"]]
             check("file list (local)", "benchy_0.05.ctb" in names and "minis" in names, names)
+            frag = [f for f in j["files"] if f.get("fragment")]
+            check("orphan upload fragment is flagged", len(frag) == 1 and frag[0]["name"].endswith("_broken.goo"), frag)
+            check("normal files are not flagged as fragments", not any(f.get("fragment") for f in j["files"] if f["name"] == "benchy_0.05.ctb"))
             f = next(f for f in j["files"] if f["name"] == "benchy_0.05.ctb")
             if minimal:
-                check("minimal firmware: no metadata but no crash", f["layers"] is None and f["layer_height"] is None and f["est_seconds"] is None)
+                check("minimal firmware: file list still works (metadata may come from file_info.txt)", f["name"] == "benchy_0.05.ctb")
             else:
                 check("file metadata extracted (layer height/layers/time/thumb)",
                       f["layer_height"] == 0.05 and f["layers"] == 1840 and f["est_seconds"] == 13200 and f["thumbnail"], f)
                 st_, body = await get("/api/fetch", params={"u": f["thumbnail"]})
                 check("thumbnail proxy returns PNG", st_ == 200 and body[:4] == b"\x89PNG")
             check("storage usage reported", j["storage"] and j["storage"]["total"] > 0)
+            check("status uses real key names (vat temp)", st["status"].get("TempOfTank") == 24 and st["status"].get("TempTargetTank") == 30, st["status"])
+            check("attributes: camera slots reported 0/2", st["camera"] and st["camera"]["max"] == 2, st.get("camera"))
             _, jj = await get("/api/files?path=/local/minis/")
             check("subfolder listing", [x["name"] for x in jj["files"]] == ["orc_bust.ctb"], jj)
             _, ju = await get("/api/files?path=/usb/")
@@ -105,6 +116,20 @@ async def main(minimal=False):
             check("upload completes (3x1MB chunks, md5 verified by printer)", x and x["upload"]["phase"] == "done" and x["upload"]["sent"] == len(payload), x and x["upload"])
             _, j = await get("/api/files?path=/local/")
             check("uploaded file shows in list", "uploaded_test.ctb" in [f["name"] for f in j["files"]])
+
+            # upload name with spaces: must reach the printer as plain text, not %20
+            payload2 = os.urandom(5000)
+            from saturn_control.printer import multipart_body
+            body2, ctype2 = multipart_body([("print_after", "0")], "file", "Arthas 15cm Base.goo", payload2)
+            async with s.post(BASE + "/api/upload", data=body2, headers={"Content-Type": ctype2}) as r:
+                up2 = await r.json()
+            await asyncio.sleep(0.5)
+            await wait_for(up_done, 20)
+            await asyncio.sleep(1.5)
+            _, ctl = await post_raw("/_mock/state", {})
+            check("upload with spaces: printer receives the plain name (no %20)", ctl["last_upload_name"] == "Arthas 15cm Base.goo", ctl["last_upload_name"])
+            _, j = await get("/api/files?path=/local/")
+            check("spaced name listed without % codes", any(f["name"] == "Arthas 15cm Base.goo" and not f.get("percent_codes") for f in j["files"]))
 
             # print control
             r = await post("/api/print", {"filename": "/local/missing.ctb"})
@@ -143,9 +168,22 @@ async def main(minimal=False):
             check("rename reflected in attributes", x)
             check("timelapse toggle", (await post("/api/timelapse", {"enable": True}))["ok"])
             r = await post("/api/light", {"on": True})
-            check("light on (assumed Cmd 403)", r["ok"] and r["light"] is True, r)
-            r = await post("/api/raw", {"cmd": 0, "data": {}})
-            check("raw command", r["ok"])
+            _, ctl = await post_raw("/_mock/state", {})
+            check("light on via Cmd 151 {ControlState:1}", r["ok"] and ctl["light"] == 1 and r["results"][0]["variant"] == "plain", r)
+            r = await post("/api/light", {"on": False})
+            _, ctl = await post_raw("/_mock/state", {})
+            check("light off via Cmd 151 {ControlState:0}", r["ok"] and ctl["light"] == 0, r)
+            r = await post("/api/raw", {"text": json.dumps({"Id": "", "Data": {"Cmd": 0, "Data": {}, "RequestID": "rawtest1", "MainboardID": "000000000001d354", "TimeStamp": 1, "From": 0}, "Topic": "sdcp/request/000000000001d354"})})
+            check("raw JSON envelope: sent and answered", r["ok"] and r["reply"] is not None, r)
+            weird = '{"Cmd":151,"Belong":"LCD","Data":{"ControlState":1}}'
+            r = await post("/api/raw", {"text": weird})
+            _, ctl = await post_raw("/_mock/state", {})
+            check("raw box sends exactly what was typed (byte for byte, even odd shapes)", weird in ctl["rx"], ctl["rx"][-3:])
+            r = await post("/api/raw", {"text": "ping"})
+            _, ctl = await post_raw("/_mock/state", {})
+            check("raw box sends non-JSON text unchanged and does not refuse", r["ok"] and "ping" in ctl["rx"], r)
+            r = await post("/api/print-params", {"params": {"NormalExposureTime": 1700}})
+            check("print params while idle: printer refuses cleanly (Ack 1)", not r["ok"] and r["results"][0]["ack"] == 1, r)
             r = await post("/api/discover")
             check("discover endpoint responds", r["ok"])
 
@@ -183,17 +221,44 @@ async def main(minimal=False):
             r = await post("/api/settings", {"printer_ip": "127.0.0.1"})
             check("settings saves IP to config.json", r["ok"] and '"printer_ip": "127.0.0.1"' in open(cfgfile).read() and '"open_browser": false' in open(cfgfile).read())
 
-            # explorer + probe
-            _, ex = await get("/api/explore?path=/local/")
-            check("explorer returns raw printer reply", ex["ok"] and ex["reply"]["FileList"] and "Ack" in ex["reply"], ex)
-            _, ex = await get("/api/explore?path=/nonexistent/")
-            check("explorer reports refused path", not ex["ok"] and ex["reply"]["Ack"] == 3, ex)
-            _, pr = await get("/api/probe?port=%d&path=/thumb/x.png" % PORTS["printer"])
-            check("http probe shows status + hex of first bytes", pr["status"] in (200, 206) and pr["hex"].startswith("89 50 4e 47"), pr)
-            _, pr2 = await get("/api/probe?port=%d&path=/websocket" % PORTS["video"])
-            check("http probe handles non-200 gracefully", pr2["ok"] and pr2["status"] == 404, pr2)
-            _, pr2 = await get("/api/probe?port=%d&path=/websocket" % PORTS["video"])
-            check("http probe handles non-200 gracefully", pr2["ok"] and pr2["status"] == 404, pr2)
+            # HTTP explorer
+            _, hl = await get("/api/http/list?path=/media/mmcblk0p3/")
+            hn = {e["name"]: e for e in hl["entries"]}
+            check("http listing parsed (names, sizes, folders)", hl["ok"] and hn["minis"]["is_dir"] and hn["benchy_0.05.ctb"]["size"] == 2048 and hn["benchy_0.05.ctb"]["mtime"] > 1_000_000_000, hl)
+            _, hr = await get("/api/http/list?path=/")
+            check("http root listing", hr["ok"] and {"media", "proc"} <= {e["name"] for e in hr["entries"]}, hr)
+            check("virtual /proc folder is flagged", (await get("/api/http/list?path=/proc/"))[1]["virtual"] is True)
+            st_, _ = await get("/api/fetch", params={"u": "/proc/kmsg"})
+            check("reading virtual files is blocked", st_ == 403)
+            st_, body = await get("/api/fetch", params={"u": "/media/mmcblk0p3/benchy_0.05.ctb", "download": "1"})
+            check("download through the app", st_ == 200 and len(body) == 2048)
+            st_, body = await get("/api/fetch", params={"u": "/media/mmcblk0p1/file_info/file_info.txt"})
+            check("file_info.txt readable through the app", st_ == 200 and b'"files"' in body)
+            _, bad = await get("/api/http/list?path=/nonexistent/")
+            check("missing folder reports an error", not bad["ok"], bad)
+            _, j = await get("/api/files?path=/local/")
+            bf2 = next(f for f in j["files"] if f["name"] == "dragon_miniature.ctb")
+            check("Files tab filled from file_info.txt (layers, thumbnail)", bf2["layers"] == 3120 and bf2["info_source"] == "file_info" and bf2["thumbnail"].endswith("_goo.bmp"), bf2)
+            st_, bmp = await get("/api/fetch", params={"u": bf2["thumbnail"]})
+            check("BMP thumbnail served as image", st_ == 200)
+            # unit checks on the parsers
+            sys.path.insert(0, str(ROOT))
+            from saturn_control import httpfs
+            fi = httpfs.parse_file_info('{"files":[{"file_name":"a.goo","est_time":0,"preview_image_path":"unknow"},{"file_name":"a.goo","est_time":99,"total_layers":5,"layer_height":0.05,"preview_image_path":"/x.bmp"},{"file_name":"a.goo","est_time":0,"preview_image_path":"unknow"}]}')
+            check("file_info duplicates collapse to the complete entry", fi["a.goo"]["est_seconds"] == 99 and fi["a.goo"]["thumbnail"] == "/x.bmp", fi)
+            mg = httpfs.parse_listing('<table><tr><th>Name</th><th>Modified</th><th>Size</th></tr><tr><td><a href="a%20b.goo">a b.goo</a></td><td>1700000000</td><td>1234</td></tr><tr><td><a href="d/">d/</a></td><td>5</td><td>[DIR]</td></tr></table>')
+            check("listing parser: epoch/size/dir/unknown-time", mg[0]["is_dir"] and mg[0]["mtime"] is None and mg[1]["size"] == 1234 and mg[1]["mtime"] == 1700000000, mg)
+
+            # camera slots + release
+            r = await post("/api/camera/release")
+            check("camera release endpoint", r["ok"], r)
+
+            # keep-alive: with --idle-kill 4 the mock drops silent clients; app must stay connected
+            _, s0 = await get("/api/state")
+            await asyncio.sleep(9)
+            _, s1 = await get("/api/state")
+            _, ctl = await post_raw("/_mock/state", {})
+            check("keep-alive prevents idle drops (no reconnects in 9 s of silence)", s1["connected"] and s1["reconnects"] == s0["reconnects"] and ctl["idle_kills"] == 0, (s0["reconnects"], s1["reconnects"], ctl["idle_kills"]))
 
             # delete
             r = await post("/api/files/delete", {"files": ["/local/uploaded_test.ctb", "/local/nope.ctb"], "folders": []})

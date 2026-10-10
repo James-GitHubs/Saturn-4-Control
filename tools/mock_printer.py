@@ -1,9 +1,13 @@
 """Mock Elegoo printer (SDCP v3.0.0) for testing the app without hardware.
 
     python tools/mock_printer.py [--port 3030] [--video-port 3031] [--udp-port 3000]
-                                 [--minimal] [--light-unsupported]
+                                 [--minimal] [--light-unsupported] [--idle-kill SECONDS]
 
-Implements everything in the public SDCP spec plus an *assumed* light command (Cmd 403).
+Implements the public SDCP spec plus the Matrix-app commands seen in the logs (Cmd 151 light,
+Cmd 135 change print params; accepted locally here, which the real printer may NOT do), the
+printer's Mongoose-style HTTP file server on the same port (directory index tables, file_info.txt,
+BMP thumbnails) and the real status/attribute key names (TempOfTank, RemainingMemory in bytes, ...).
+--idle-kill N drops any websocket client that sends nothing for N seconds (the 45 s drop bug).
 --minimal makes file lists contain only the spec-guaranteed fields (no layers/time/thumbnail),
 to exercise the UI fallbacks. Needs Pillow for thumbnails and camera frames.
 """
@@ -40,6 +44,9 @@ class Mock:
         self.pi = {"Status": 0, "CurrentLayer": 0, "TotalLayer": 0, "CurrentTicks": 0,
                    "TotalTicks": 0, "Filename": "", "ErrorNumber": 0, "TaskId": ""}
         self.light = 0
+        self.params = {"NormalExposureTime": 2500.0, "BottomExposureTime": 30000.0, "BottomLayer": 5}
+        self.rx = []
+        self.idle_kills = 0                       # every raw text frame received, for the tests
         self.timelapse = 0
         self.streams = 0
         self.uploads = {}
@@ -57,6 +64,7 @@ class Mock:
         (self.root / "local" / "minis").mkdir(exist_ok=True)
         self.add_file("local/minis", "orc_bust.ctb", 0.04, 2500, 17400)
         self.add_file("usb", "usb_test.ctb", 0.05, 600, 5000)
+        (self.root / "local" / ("0123456789abcdef0123456789abcdef_broken.goo")).write_bytes(os.urandom(512))
         now = int(time.time())
         for k in range(3):
             self.history.append({
@@ -94,8 +102,8 @@ class Mock:
     def status_msg(self):
         cur = [self.status]
         return self.envelope("status", {"Status": {
-            "CurrentStatus": cur, "PreviousStatus": self.prev, "PrintScreen": 12345, "ReleaseFilm": 321,
-            "TempOfUVLED": 31.5, "TimeLapseStatus": self.timelapse, "TempOfBox": 28, "TempTargetBox": 0,
+            "CurrentStatus": cur, "PreviousStatus": self.prev, "ReleaseFilm": 321,
+            "TempOfUVLED": 31.5, "TimeLapseStatus": self.timelapse, "HeatStatus": 0, "TempOfTank": 24, "TempTargetTank": 30,
             "PrintInfo": dict(self.pi)}})
 
     def attr_msg(self):
@@ -103,13 +111,13 @@ class Mock:
             "Name": self.name, "MachineName": "Saturn 4 Ultra 16K (mock)", "BrandName": "ELEGOO",
             "ProtocolVersion": "V3.0.0", "FirmwareVersion": "V1.4.2", "Resolution": "15120x6230",
             "XYZsize": "218.88x122.88x220", "MainboardIP": "127.0.0.1", "MainboardID": MAINBOARD,
-            "NumberOfVideoStreamConnected": self.streams, "MaximumVideoStreamAllowed": 1,
+            "NumberOfVideoStreamConnected": self.streams, "MaximumVideoStreamAllowed": 2,
             "NetworkStatus": "wlan", "UsbDiskStatus": 1, "Capabilities": ["FILE_TRANSFER", "PRINT_CONTROL", "VIDEO_STREAM"],
             "SupportFileType": ["CTB", "GOO"],
             "DevicesStatus": {"TempSensorStatusOfUVLED": 1, "LCDStatus": 1, "SgStatus": 1, "ZMotorStatus": 1,
-                              "RotateMotorStatus": 1, "RelaseFilmState": 1, "XMotorStatus": 1},
+                              "RotateMotorStatus": 1, "RelaseFilmState": 1, "TankStatus": 1},
             "ReleaseFilmMax": 2000, "TempOfUVLEDMax": 60, "CameraStatus": 1,
-            "RemainingMemory": 8 * 1024 ** 3 * 8, "TLPNoCapPos": 50.0, "TLPStartCapPos": 30.0, "TLPInterLayers": 20}})
+            "RemainingMemory": 6 * 1024 ** 3, "TLPNoCapPos": 50.0, "TLPStartCapPos": 30.0, "TLPInterLayers": 20}})
 
     async def broadcast(self, msg):
         for ws in list(self.clients):
@@ -120,7 +128,9 @@ class Mock:
 
     # --------------------------------------------------------------- commands
     async def handle(self, ws, req):
-        d = req["Data"]
+        d = req.get("Data")
+        if not isinstance(d, dict) or "Cmd" not in d:
+            return                             # not an SDCP request: ignored, like the real board
         cmd, data = d["Cmd"], d.get("Data") or {}
         ack, out = 0, {}
         if req.get("Topic") != f"sdcp/request/{MAINBOARD}" or d.get("MainboardID") != MAINBOARD:
@@ -195,7 +205,7 @@ class Mock:
             out = {"HistoryDetailList": [h for h in self.history if h["TaskId"] in ids]}
         elif cmd == 386:
             if data.get("Enable"):
-                if self.streams >= 1:
+                if self.streams >= 2:
                     ack = 1
                 else:
                     out = {"VideoUrl": "rtsp://127.0.0.1:1/video" if self.args.rtsp_dead else f"http://127.0.0.1:{self.args.video_port}/video"}
@@ -203,8 +213,13 @@ class Mock:
                 pass
         elif cmd == 387:
             self.timelapse = 1 if data.get("Enable") else 0
-        elif cmd == 403 and not self.args.light_unsupported and "LightStatus" in data:
-            self.light = int(bool(data["LightStatus"].get("SecondLight", 0)))
+        elif cmd == 151 and not self.args.light_unsupported and "ControlState" in data:
+            self.light = int(bool(data["ControlState"]))
+        elif cmd == 135 and not self.args.light_unsupported and self.status == 1 and data:
+            for k, v in data.items():
+                self.params[k] = v
+        elif cmd == 135 and not self.args.light_unsupported:
+            ack = 1
         else:
             return  # unknown command: silence (like the real board does for some)
         resp = {"Id": BRAND, "Data": {"Cmd": cmd, "Data": {"Ack": ack, **out},
@@ -282,12 +297,22 @@ def make_apps(m: Mock):
         # Real boards push status/attributes on connect, with the mainboard id inside.
         await ws.send_str(json.dumps(m.attr_msg()))
         await ws.send_str(json.dumps(m.status_msg()))
-        async for msg in ws:
-            if msg.data == "ping":
-                await ws.send_str("pong")
-                continue
+        while True:
             try:
-                await m.handle(ws, json.loads(msg.data))
+                msg = await ws.receive(timeout=m.args.idle_kill or None)
+            except asyncio.TimeoutError:
+                m.idle_kills += 1
+                await ws.close()
+                break
+            if msg.type != web.WSMsgType.TEXT:
+                break
+            m.rx.append(msg.data)
+            try:
+                req = json.loads(msg.data)
+            except ValueError:
+                continue                       # plain text such as "ping": real board ignores it
+            try:
+                await m.handle(ws, req)
             except Exception as e:  # noqa: BLE001
                 print("mock error", e)
         m.clients.discard(ws)
@@ -326,6 +351,7 @@ def make_apps(m: Mock):
             await m.broadcast(m.status_msg())
             await asyncio.sleep(0.8)  # "verifying"
             os.replace(up["tmp"], m.root / "local" / up["name"])
+            m.last_upload_name = up["name"]
             m.meta[f"/local/{up['name']}"] = {"layer_height": 0.05, "layers": 321, "print_time": 4000}
             m.uploads.pop(uid, None)
             m.status = 0
@@ -338,15 +364,78 @@ def make_apps(m: Mock):
     async def timelapse(request):
         return web.Response(body=b"\x00" * 1024, content_type="video/mp4")
 
+    def dir_page(path, rows):
+        out = [f"<html><head><title>Index of {path}</title></head><body><h1>Index of {path}</h1><table>",
+               "<tr><th>Name</th><th>Modified</th><th>Size</th></tr>"]
+        for name, mt, size in rows:
+            isdir = size is None
+            out.append(f'<tr><td><a href="{name}{"/" if isdir else ""}">{name}{"/" if isdir else ""}</a></td>'
+                       f'<td name={mt}>{time.strftime("%d-%b-%Y %H:%M", time.gmtime(mt))}</td>'
+                       f'<td name={-1 if isdir else size}>{"[DIR]" if isdir else size}</td></tr>')
+        out.append("</table></body></html>")
+        return web.Response(text="".join(out), content_type="text/html")
+
+    def file_info_text():
+        ents = []
+        for rel, mt in m.meta.items():
+            if not rel.startswith("/local/") or "/" in rel[7:]:
+                continue
+            n = rel[7:]
+            p = m.root / "local" / n
+            if not p.exists():
+                continue
+            ents.append({"file_name": n, "file_size": p.stat().st_size, "layer_height": mt["layer_height"],
+                         "total_layers": mt["layers"], "est_time": mt["print_time"], "create_time": 1700000000,
+                         "preview_image_path": f"/media/mmcblk0p1/file_info/{n}_goo.bmp", "resin_name": "unknow"})
+        dup = dict(ents[0], est_time=0, preview_image_path="unknow") if ents else None
+        ents = ([dup] if dup else []) + ents + [dict(e) for e in ents[:1]]       # duplicates + an orphan
+        return json.dumps({"files": ents})
+
+    async def http_fs(request):
+        path = "/" + request.match_info.get("tail", "")
+        if path.startswith("/proc"):
+            return web.Response(text="x" * 10)
+        if path == "/media/mmcblk0p1/file_info/file_info.txt":
+            return web.Response(text=file_info_text() + "\x00")
+        if path.startswith("/media/mmcblk0p1/file_info/") and path.endswith(".bmp"):
+            return web.Response(body=png(path)[:200], content_type="application/octet-stream")
+        if path.startswith("/media/mmcblk0p3/"):
+            rel = path[len("/media/mmcblk0p3/"):]
+            t = m.root / "local" / rel
+            if path.endswith("/"):
+                if not t.is_dir():
+                    return web.Response(status=404)
+                return dir_page(path, [(f.name, int(f.stat().st_mtime), None if f.is_dir() else f.stat().st_size) for f in sorted(t.iterdir())])
+            if t.is_file():
+                return web.FileResponse(t)
+            return web.Response(status=404)
+        tree = {"/": ["media", "proc", "config"], "/media/": ["mmcblk0p1", "mmcblk0p3"],
+                "/media/mmcblk0p1/": ["file_info"], "/config/": [], "/proc/": []}
+        if path in tree:
+            return dir_page(path, [(n, 5, None) for n in tree[path]])
+        if path == "/media/mmcblk0p1/file_info/":
+            n = int(time.time())
+            return dir_page(path, [("file_info.txt", n, len(file_info_text()))])
+        return web.Response(status=404)
+
+    async def control(request):
+        b = await request.json()
+        if "light" in b:
+            return web.json_response({"light": m.light})
+        return web.json_response({"light": m.light, "params": m.params, "rx": m.rx, "idle_kills": m.idle_kills,
+                                  "streams": m.streams, "last_upload_name": getattr(m, "last_upload_name", None)})
+
+    app.router.add_post("/_mock/state", control)
     app.router.add_get("/websocket", ws_handler)
     app.router.add_post("/uploadFile/upload", upload)
     app.router.add_get("/thumb/{name}", thumb)
     app.router.add_get("/timelapse.mp4", timelapse)
+    app.router.add_get("/{tail:.*}", http_fs)
 
     vapp = web.Application()
 
     async def video(request):
-        if m.streams >= 1:
+        if m.streams >= 2:
             return web.Response(status=503, text="max streams")
         m.streams += 1
         resp = web.StreamResponse()
@@ -409,4 +498,5 @@ if __name__ == "__main__":
     ap.add_argument("--minimal", action="store_true")
     ap.add_argument("--rtsp-dead", action="store_true", help="advertise an unreachable RTSP camera URL")
     ap.add_argument("--light-unsupported", action="store_true")
+    ap.add_argument("--idle-kill", type=float, default=0, help="drop websocket clients silent for this many seconds")
     asyncio.run(amain(ap.parse_args()))

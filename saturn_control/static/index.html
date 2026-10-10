@@ -28,8 +28,10 @@
     <div class="card" id="camCard">
       <div class="card-h">
         <h2>Camera</h2>
+        <span id="camSlots" class="chip hidden" title="Video clients connected to the printer / allowed"></span>
         <div class="spacer"></div>
         <button class="btn sm" id="camToggle">Start</button>
+        <button class="btn sm" id="camRelease" title="Tell the printer we are done with the camera (frees a stuck slot)">Release</button>
         <button class="btn sm" id="camSnap" title="Save a snapshot">📷</button>
         <button class="btn sm" id="camFull" title="Fullscreen">⛶</button>
       </div>
@@ -91,6 +93,7 @@
           <button class="btn sm" id="btnRawFiles" title="Copy the printer's raw file list reply, for troubleshooting">{ } Raw</button>
           <input type="file" id="fileInput" accept=".ctb,.cbddlp,.goo,.photon,.pwmx,.zip,*" hidden multiple>
         </div>
+        <div id="fragBar" class="fragbar hidden"><label class="chk"><input type="checkbox" id="showFrag"> <span id="fragText"></span></label></div>
         <div id="storageBar" class="storage hidden"><div id="storageFill"></div><span id="storageText"></span></div>
         <div id="uploadBox" class="upload hidden">
           <div class="up-row"><b id="upName"></b><span id="upPhase"></span><button class="btn sm danger" id="upCancel">Cancel</button></div>
@@ -118,10 +121,24 @@
           <div class="row"><input class="input" id="inName"><button class="btn" id="btnRename">Rename</button></div>
           <label>Time-lapse photography</label>
           <div class="row"><label class="switch"><input type="checkbox" id="tlSwitch"><span></span></label><span class="muted">Printer records a time-lapse of each print</span></div>
-          <label class="lightRow">Light</label>
-          <div class="row lightRow"><button class="btn" id="lightOn">Turn on</button><button class="btn" id="lightOff">Turn off</button><span class="muted" id="lightNote"></span></div>
           <label>Find printers on the network</label>
           <div class="row"><button class="btn" id="btnDiscover">Scan (UDP)</button><span class="muted" id="discoverOut"></span></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-h"><h2>Experimental: Matrix-app commands</h2></div>
+        <div class="form">
+          <div class="muted">The Matrix app sends these through Elegoo's cloud. They are tried here over your local network; the printer may simply ignore them. The result of each try is shown and written to the Console.</div>
+          <label>Light (Cmd 151)</label>
+          <div class="row"><button class="btn" id="lightOn">Turn on</button><button class="btn" id="lightOff">Turn off</button><span class="muted" id="lightNote"></span></div>
+          <label>Live print tweaks (Cmd 135, while a print is running)</label>
+          <div class="row">
+            <label class="chk">Normal exposure (s) <input class="input narrow" id="pxNormal" type="number" step="0.1" min="0"></label>
+            <label class="chk">Bottom exposure (s) <input class="input narrow" id="pxBottom" type="number" step="0.1" min="0"></label>
+            <label class="chk">Bottom layers <input class="input narrow" id="pxLayers" type="number" step="1" min="0"></label>
+            <button class="btn" id="pxApply">Apply</button>
+          </div>
+          <div class="muted" id="pxOut"></div>
         </div>
       </div>
       <div class="card">
@@ -146,34 +163,25 @@
     </div>
 
 
-    <!-- EXPLORER -->
+    <!-- EXPLORER (the printer's HTTP file server, read-only) -->
     <div class="tab hidden" id="tab-explorer">
       <div class="card">
-        <div class="card-h wrap"><h2>Printer file explorer</h2><div class="spacer"></div><button class="btn sm" id="exReport">Copy report</button></div>
-        <div class="form">
-          <div class="muted">Browses whatever the printer will list for a path and shows its raw reply. Nothing here changes anything on the printer.</div>
-          <div class="row">
-            <button class="btn sm" id="exUp">⬆ Up</button>
-            <input class="input grow mono" id="exPath" value="/local/">
-            <button class="btn" id="exGo">Go</button>
-          </div>
-          <div class="row" id="exQuick"></div>
-          <div id="exList" class="files"></div>
-          <label>Raw reply</label>
-          <pre id="exRaw" class="mono out"></pre>
+        <div class="card-h wrap">
+          <h2>Printer files</h2><span class="muted">read-only view of the printer's web server</span>
+          <div class="spacer"></div>
+          <button class="btn sm" id="exBack" title="Back" disabled>◀</button>
+          <button class="btn sm" id="exFwd" title="Forward" disabled>▶</button>
+          <button class="btn sm" id="exUp" title="Up one folder">⬆ Up</button>
+          <button class="btn sm" id="exRefresh">⟳ Refresh</button>
         </div>
-      </div>
-      <div class="card">
-        <div class="card-h"><h2>HTTP probe</h2></div>
-        <div class="form">
-          <div class="muted">Browses the printer's web server (port 80 is where thumbnails live, e.g. /board-resource/history_image/). Directory listings show clickable links; files show their first bytes.</div>
-          <div class="row">
-            <select class="input" id="prPort"><option>80</option><option>3030</option><option>3031</option><option>8080</option></select>
-            <input class="input grow mono" id="prPath" value="/board-resource/">
-            <button class="btn" id="prGo">Probe</button>
+        <div class="ex-bar"><div id="exCrumbs" class="crumbs"></div><div id="exQuick" class="ex-quick"></div></div>
+        <div class="ex-wrap">
+          <div class="ex-tree" id="exTree"></div>
+          <div class="ex-main">
+            <div class="ex-head" id="exHead"><span data-sort="name">Name</span><span data-sort="mtime">Modified</span><span data-sort="size">Size</span><span></span></div>
+            <div id="exList" class="ex-list"></div>
+            <div id="exInfo" class="muted ex-info"></div>
           </div>
-          <div class="row" id="prLinks"></div>
-          <pre id="prOut" class="mono out"></pre>
         </div>
       </div>
     </div>
@@ -184,7 +192,7 @@
   <div class="card-h wrap">
     <h2>Console</h2>
     <label class="chk"><input type="checkbox" id="lgStatus"> status updates</label>
-    <label class="chk"><input type="checkbox" id="lgDebug"> upload chunks</label>
+    <label class="chk"><input type="checkbox" id="lgDebug"> keep-alive / chunks</label>
     <label class="chk"><input type="checkbox" id="lgRaw"> raw JSON</label>
     <div class="spacer"></div>
     <button class="btn sm" id="lgCopy">Copy</button>
@@ -193,7 +201,10 @@
   </div>
   <div id="logView" class="logview mono"></div>
   <div class="logcmd">
-    <input class="input grow mono" id="rawLine" placeholder='Send raw command, e.g.  258 {"Url":"/local/"}   or   0' autocomplete="off">
+    <select class="input" id="rawPreset" title="Fill the box with a complete message"><option value="">Templates…</option></select>
+    <input class="input narrow" id="rawCmd" type="number" placeholder="Cmd #" title="Command number for Fill envelope">
+    <button class="btn" id="rawFill" title="Fill the box with a complete SDCP message for that command number">Fill envelope</button>
+    <textarea class="input grow mono" id="rawLine" rows="2" spellcheck="false" autocomplete="off" placeholder='Exactly what you type is sent to the printer, unchanged (Enter sends, Shift+Enter = new line). e.g. a complete JSON message, or just: ping'></textarea>
     <button class="btn" id="rawSend">Send</button>
   </div>
 </section>

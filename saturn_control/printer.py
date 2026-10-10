@@ -14,11 +14,15 @@ from collections import deque
 
 import aiohttp
 
+from .httpfs import FILE_INFO_PATH, parse_file_info
+
 CMD = {
     "STATUS": 0, "ATTRIBUTES": 1, "START": 128, "PAUSE": 129, "STOP": 130,
     "CONTINUE": 131, "STOP_FEEDING": 132, "SKIP_PREHEAT": 133, "RENAME": 192,
     "ABORT_UPLOAD": 255, "FILES": 258, "DELETE": 259, "HISTORY": 320,
     "HISTORY_DETAIL": 321, "VIDEO": 386, "TIMELAPSE": 387,
+    # Seen in the Matrix app's cloud (RTM) traffic; whether the local websocket accepts them is untested:
+    "CHANGE_PARAMS": 135, "LIGHT": 151,
 }
 
 ACK_TEXT = {
@@ -178,6 +182,10 @@ class PrinterClient:
         self.errors = deque(maxlen=50)
         self.log = deque(maxlen=1000)
         self.pending = {}
+        self._quiet = set()         # RequestIDs of keep-alive polls: logged as 'debug', not as console noise
+        self.reconnects = 0
+        self.light_variant = None   # name of the light message variant the printer answered, if any
+        self._fi = (0, {})
         self.upload = None          # dict describing the current/last upload
         self.light = None           # optimistic light state (True/False/None)
         self.video_url = None
@@ -238,16 +246,18 @@ class PrinterClient:
 
     async def _connect_once(self):
         url = f"ws://{self.ip}:{self.port}/websocket"
-        async with self.session.ws_connect(url, heartbeat=None, receive_timeout=45,
-                                           max_msg_size=0, timeout=8) as ws:
+        # No receive_timeout: the printer pushes nothing while idle, so a read timeout dropped the
+        # connection every ~45 s. Liveness is checked by _keepalive() instead (Cmd 0 must be answered).
+        async with self.session.ws_connect(url, heartbeat=None, max_msg_size=0, timeout=8) as ws:
             self.ws = ws
             self.connected = True
+            self.reconnects += 1
             self.last_error = ""
             self._seen_initial.clear()
             self.status, self.attributes = {}, {}
             self.note(f"Connected to printer at {url}")
             self.on_change()
-            hb = asyncio.create_task(self._heartbeat(ws))
+            hb = asyncio.create_task(self._keepalive(ws))
             init = asyncio.create_task(self._post_connect())
             try:
                 async for msg in ws:
@@ -259,10 +269,28 @@ class PrinterClient:
                 hb.cancel()
                 init.cancel()
 
-    async def _heartbeat(self, ws):
+    async def _keepalive(self, ws):
+        """Poll the printer every few seconds (status; attributes every 5th time so the camera-client
+        counters stay fresh). Two unanswered polls in a row = dead connection -> reconnect."""
+        interval = float(self.cfg.get("keepalive_seconds", 12))
+        timeout = float(self.cfg.get("keepalive_timeout", 8))
+        misses = beats = 0
         while True:
-            await asyncio.sleep(15)
-            await ws.send_str("ping")
+            await asyncio.sleep(interval)
+            beats += 1
+            try:
+                await self.request(CMD["ATTRIBUTES"] if beats % 5 == 0 else CMD["STATUS"],
+                                   timeout=timeout, quiet=True)
+                misses = 0
+            except PrinterError as e:
+                if ws.closed:
+                    return
+                misses += 1
+                self.note(f"Keep-alive: no answer ({misses}/2): {e}", "debug")
+                if misses >= 2:
+                    self.note("Printer stopped answering - reconnecting", "error")
+                    await ws.close()
+                    return
 
     async def _post_connect(self):
         if not self.mainboard_id:
@@ -299,8 +327,15 @@ class PrinterClient:
         if mb and not self.mainboard_id:
             self.mainboard_id = mb
         if kind == "response" or (not kind and data.get("RequestID")):
-            fut = self.pending.pop(data.get("RequestID"), None)
-            if fut is None:
+            rid = data.get("RequestID")
+            fut = self.pending.pop(rid, None)
+            quiet = rid in self._quiet
+            self._quiet.discard(rid)
+            if fut is not None and quiet:
+                self._emit("in", "debug", _summarise("in", obj)[1], msg=obj)
+                if not fut.done():
+                    fut.set_result(data)
+            elif fut is None:
                 # Not an answer to anything we sent: another client (phone app, Lychee...) is talking to the printer.
                 cmd = data.get("Cmd")
                 self._emit("in", "other", f"OTHER CLIENT  Cmd {cmd} -> {json.dumps(data.get('Data'), separators=(',', ':'))[:600]}", msg=obj)
@@ -327,7 +362,7 @@ class PrinterClient:
             self.notices.append({"t": time.time(), "data": data.get("Data") or data})
         self.on_change()
 
-    NOISY = {"CurrentTicks", "CurrentLayer", "TempOfUVLED", "TempOfBox", "PrintScreen", "TimeStamp",
+    NOISY = {"CurrentTicks", "CurrentLayer", "TempOfUVLED", "TimeStamp", "ReleaseFilm",
              "RemainingMemory", "TotalTicks"}
 
     def _log_changes(self, what, old, new):
@@ -355,30 +390,108 @@ class PrinterClient:
                 self._emit("in", "change", f"{what} {k}: {o[k]!r} -> {n[k]!r}")
 
     # ------------------------------------------------------------ requests
-    async def request(self, cmd, data=None, timeout=10):
-        """Send an SDCP request and return the response Data dict (contains 'Ack')."""
-        if not self.ws or self.ws.closed:
-            raise PrinterError("Not connected to the printer")
-        rid = uuid.uuid4().hex
-        msg = {
+    def envelope(self, cmd, data=None, extra=None):
+        """The standard SDCP request message. `extra` adds keys next to Cmd/Data (e.g. Belong/ProVer)."""
+        return {
             "Id": self.brand_id,
             "Data": {
-                "Cmd": cmd, "Data": data or {}, "RequestID": rid,
+                "Cmd": cmd, **(extra or {}), "Data": data or {}, "RequestID": uuid.uuid4().hex,
                 "MainboardID": self.mainboard_id, "TimeStamp": int(time.time()), "From": 0,
             },
             "Topic": f"sdcp/request/{self.mainboard_id}",
         }
+
+    async def request(self, cmd, data=None, timeout=10, quiet=False):
+        """Send an SDCP request and return the response Data dict (contains 'Ack')."""
+        if not self.ws or self.ws.closed:
+            raise PrinterError("Not connected to the printer")
+        msg = self.envelope(cmd, data)
+        rid = msg["Data"]["RequestID"]
         fut = asyncio.get_running_loop().create_future()
         self.pending[rid] = fut
-        self._log("out", msg)
+        if quiet:
+            self._quiet.add(rid)
+            self._emit("out", "debug", _summarise("out", msg)[1], msg=msg)
+        else:
+            self._log("out", msg)
         await self.ws.send_str(json.dumps(msg))
         try:
             resp = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             self.pending.pop(rid, None)
+            self._quiet.discard(rid)
             raise PrinterError(f"Printer did not answer command {cmd} within {timeout}s "
                                "(it may not support it)")
         return resp.get("Data") or {}
+
+    async def send_raw(self, text, wait=6.0):
+        """Send `text` over the websocket byte for byte - no parsing, no validation, nothing blocked.
+        If it happens to be JSON with a Data.RequestID, also wait for the matching reply."""
+        if not self.ws or self.ws.closed:
+            raise PrinterError("Not connected to the printer")
+        obj, rid = None, None
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            pass
+        inner = obj.get("Data") if isinstance(obj, dict) else None
+        if isinstance(inner, dict):
+            rid = inner.get("RequestID")
+        fut = None
+        if rid:
+            fut = asyncio.get_running_loop().create_future()
+            self.pending[str(rid)] = fut
+        if isinstance(obj, dict):
+            self._log("out", obj)
+        else:
+            self._emit("out", "request", "RAW (not JSON): " + text[:500])
+        await self.ws.send_str(text)
+        if fut is None:
+            return {"sent": True, "json": obj is not None, "reply": None,
+                    "note": "Sent. No Data.RequestID in the message, so I am not waiting for a reply - watch the console."}
+        try:
+            resp = await asyncio.wait_for(fut, wait)
+            return {"sent": True, "json": True, "reply": resp}
+        except asyncio.TimeoutError:
+            self.pending.pop(str(rid), None)
+            return {"sent": True, "json": True, "reply": None,
+                    "note": f"Sent. The printer did not answer within {wait:g}s (it may ignore this command)."}
+
+    async def light_test(self, on):
+        """Try the known ways of asking for the light, stop at the first one the printer answers.
+        Cmd 151 {ControlState} is what the Matrix app sends over the cloud channel; the local
+        websocket may not support it at all, so this reports exactly what the printer did."""
+        state = 1 if on else 0
+        machine = (self.attributes or {}).get("MachineName") or "Saturn 4 Ultra 16K"
+        variants = [
+            ("plain", self.envelope(CMD["LIGHT"], {"ControlState": state})),
+            ("matrix-fields", self.envelope(CMD["LIGHT"], {"ControlState": state},
+                                            {"Belong": "LCD", "ProVer": "0.0.1", "MachineType": machine})),
+        ]
+        if self.light_variant:        # one that worked before goes first
+            variants.sort(key=lambda v: v[0] != self.light_variant)
+        results = []
+        for name, msg in variants:
+            r = await self.send_raw(json.dumps(msg), wait=3.0)
+            ack = ((r.get("reply") or {}).get("Data") or {}).get("Ack")
+            results.append({"variant": name, "answered": r.get("reply") is not None, "ack": ack})
+            if r.get("reply") is not None:
+                if ack == 0:
+                    self.light, self.light_variant = on, name
+                    self.on_change()
+                break
+        return results
+
+    async def set_print_params(self, params):
+        """Cmd 135 (change print params), one key per message like the Matrix app sends it."""
+        out = []
+        for k, v in params.items():
+            try:
+                d = await self.request(CMD["CHANGE_PARAMS"], {k: v}, timeout=4)
+                out.append({"key": k, "value": v, "answered": True, "ack": d.get("Ack")})
+            except PrinterError as e:
+                out.append({"key": k, "value": v, "answered": False, "error": str(e)})
+        return out
 
     async def command(self, cmd, data=None, timeout=10):
         """request() + Ack interpretation. Returns (ok, ack, message, data)."""
@@ -433,12 +546,38 @@ class PrinterClient:
             self._hist_cache = (time.time(), items)
         return items
 
+    async def file_info(self, max_age=15):
+        """{file name: details} from the printer's own database (file_info.txt, served over HTTP)."""
+        t, cached = self._fi
+        if time.time() - t < max_age:
+            return cached
+        url = f"http://{self.ip}:{self.port}{FILE_INFO_PATH}"
+        try:
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return cached
+                text = (await r.read()).decode("utf-8", "replace")
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            return cached
+        info = parse_file_info(text)
+        self._fi = (time.time(), info)
+        return info
+
+    def camera_slots(self):
+        a = self.attributes or {}
+        used, mx = a.get("NumberOfVideoStreamConnected"), a.get("MaximumVideoStreamAllowed")
+        if used is None or mx is None:
+            return None
+        return {"used": used, "max": mx, "ours": bool(self.video_enabled),
+                "others": max(used - (1 if self.video_enabled else 0), 0)}
+
     def reconfigure(self, ip):
         """Switch to a new printer IP at runtime: drop the connection and let the loop reconnect."""
         self.ip = ip
         self.cfg["printer_ip"] = ip
         self.mainboard_id = ""
         self._hist_cache = (0, [])
+        self._fi = (0, {})
         self.note(f"Printer IP changed to {ip}")
         if self.ws and not self.ws.closed:
             asyncio.ensure_future(self.ws.close())
@@ -475,16 +614,11 @@ class PrinterClient:
                     chunk = f.read(CHUNK)
                     if not chunk and offset >= size:
                         break
-                    form = aiohttp.FormData()
-                    form.add_field("S-File-MD5", md5)
-                    form.add_field("Check", "1")
-                    form.add_field("Offset", str(offset))
-                    form.add_field("Uuid", file_uuid)
-                    form.add_field("TotalSize", str(size))
-                    form.add_field("File", chunk, filename=filename,
-                                   content_type="application/octet-stream")
+                    body, ctype = multipart_body(
+                        [("S-File-MD5", md5), ("Check", "1"), ("Offset", str(offset)),
+                         ("Uuid", file_uuid), ("TotalSize", str(size))], "File", filename, chunk)
                     async with self.session.post(
-                            url, data=form, headers={"S-File-MD5": md5},
+                            url, data=body, headers={"S-File-MD5": md5, "Content-Type": ctype},
                             timeout=aiohttp.ClientTimeout(total=120)) as r:
                         body = await r.text()
                         try:
@@ -558,6 +692,10 @@ class PrinterClient:
             "remaining_ms": max(total_t - cur_t, 0) if total_t else None,
             "upload": self.upload,
             "light": self.light,
+            "light_variant": self.light_variant,
+            "reconnects": self.reconnects,
+            "brand_id": self.brand_id,
+            "camera": self.camera_slots(),
             "video_enabled": self.video_enabled,
             "notices": list(self.notices)[-10:],
             "errors": list(self.errors)[-10:],
@@ -574,6 +712,23 @@ def _upload_error(js):
         else:
             parts.append(f"{m.get('field')}: {m.get('message')}")
     return "; ".join(parts) or json.dumps(js)[:200]
+
+
+def multipart_body(fields, file_field, filename, payload):
+    """Hand-built multipart/form-data. aiohttp's FormData writes the file name percent-encoded
+    ('filename="Arthas%2015cm%20Base.goo"' plus a filename* twin), and this printer stores that
+    text literally - so the name must go out as plain text, like a browser or Lychee sends it."""
+    boundary = "----SaturnControl" + uuid.uuid4().hex
+    out = bytearray()
+    for k, v in fields:
+        out += (f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n').encode()
+    safe = filename.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", "")
+    out += (f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="').encode()
+    out += safe.encode("utf-8")
+    out += b'"\r\nContent-Type: application/octet-stream\r\n\r\n'
+    out += payload
+    out += f"\r\n--{boundary}--\r\n".encode()
+    return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
 async def discover(target="255.255.255.255", port=3000, timeout=2.0):
@@ -627,6 +782,8 @@ def _summarise(direction, m):
     names = {v: k.replace("_", " ").title() for k, v in CMD.items()}
     names.update({403: "Set property (light/speed/fan)"})
     d = m.get("Data") if isinstance(m.get("Data"), dict) else {}
+    if "Cmd" in m and "Cmd" not in d:        # hand-typed message without the SDCP wrapper
+        d = m
     topic = m.get("Topic", "")
     kind = topic.split("/")[1] if topic.count("/") >= 2 else "?"
     if direction == "out":

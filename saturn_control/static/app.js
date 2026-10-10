@@ -2,6 +2,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 let S = null;                        // last printer state
+let cfgLight = false;                // config.json light_enabled
 let root = "/local/", curPath = "/local/";
 let fileItems = [];
 const selected = new Set();
@@ -105,9 +106,15 @@ function render(serverDown) {
   if (S.print_error) { je.textContent = S.print_error; je.classList.remove("hidden"); } else je.classList.add("hidden");
 
   // light + timelapse
+  $("btnLight").classList.toggle("hidden", !(cfgLight || S.light_variant));
   $("btnLight").classList.toggle("on", S.light === true);
   $("btnLight").textContent = S.light === true ? "💡 Light on" : "💡 Light";
-  $("lightNote").textContent = S.light == null ? "Current state unknown until first toggled from here" : "";
+  const cs = S.camera, chipC = $("camSlots");
+  if (cs) {
+    chipC.classList.remove("hidden"); chipC.textContent = `Camera slots ${cs.used}/${cs.max}`;
+    chipC.classList.toggle("warn", cs.others > 0);
+    chipC.title = cs.others > 0 ? `${cs.others} other viewer(s) are using the printer camera (the Matrix app's live view counts as one)` : "Only this app is using the camera";
+  } else chipC.classList.add("hidden");
   const tl = (S.status || {}).TimeLapseStatus;
   if (tl != null && document.activeElement !== $("tlSwitch")) $("tlSwitch").checked = !!tl;
 
@@ -118,38 +125,40 @@ function render(serverDown) {
   $("btnDeleteSel").disabled = !selected.size;
 }
 function kv(k, v) { return `<div><label>${esc(k)}</label><b>${esc(v ?? "–")}</b></div>`; }
+function kvo(k, v) { return v == null ? "" : kv(k, v); }      // optional: left out when the printer does not report it
 function renderInfo(a) {
   const st = S.status || {};
+  const film = st.ReleaseFilm, filmMax = a.ReleaseFilmMax;
   $("machineStats").innerHTML = [
-    kv("UV LED temp", st.TempOfUVLED != null ? Number(st.TempOfUVLED).toFixed(2) + " °C" : null),
-    kv("Chamber temp", st.TempOfBox != null ? Number(st.TempOfBox).toFixed(2) + " °C" : null),
-    kv("Target chamber", st.TempTargetBox ? st.TempTargetBox + " °C" : null),
-    kv("Screen use", st.PrintScreen != null ? fmtDur(st.PrintScreen) : null),
-    kv("Release film cycles", st.ReleaseFilm != null ? `${st.ReleaseFilm}${a.ReleaseFilmMax ? " / " + a.ReleaseFilmMax : ""}` : null),
-    kv("Time-lapse", st.TimeLapseStatus ? "On" : "Off"),
-  ].join("");
+    kvo("Vat temp", st.TempOfTank != null ? `${Number(st.TempOfTank).toFixed(0)} °C` + (st.TempTargetTank ? ` (target ${st.TempTargetTank} °C)` : "") : null),
+    kvo("Vat heater", st.HeatStatus != null ? (st.HeatStatus ? "On" : "Off") : null),
+    kvo("UV LED temp", st.TempOfUVLED != null ? Number(st.TempOfUVLED).toFixed(2) + " °C" : null),
+    kvo("Release film use", film != null ? `${film}${filmMax ? ` / ${filmMax} (${Math.round(film / filmMax * 100)}%)` : ""}` : null),
+    kvo("Time-lapse", st.TimeLapseStatus != null ? (st.TimeLapseStatus ? "On" : "Off") : null),
+    kvo("Free space", a.RemainingMemory != null ? fmtSize(a.RemainingMemory) : null),
+  ].join("") || '<div class="muted">Waiting for printer…</div>';
   const d = a.DevicesStatus || {};
-  const ok = (v, labels) => labels[v] ?? v;
-  $("deviceStats").innerHTML = [
-    kv("UV LED sensor", ok(d.TempSensorStatusOfUVLED, ["Disconnected", "Normal", "Abnormal"])),
-    kv("LCD", ok(d.LCDStatus, ["Disconnected", "Connected"])),
-    kv("Strain gauge", ok(d.SgStatus, ["Disconnected", "Normal", "Calibration failed"])),
-    kv("Z motor", ok(d.ZMotorStatus, ["Disconnected", "Connected"])),
-    kv("X motor", ok(d.XMotorStatus, ["Disconnected", "Connected"])),
-    kv("Rotary motor", ok(d.RotateMotorStatus, ["Disconnected", "Connected"])),
-    kv("Release film", ok(d.RelaseFilmState, ["Abnormal", "Normal"])),
-    kv("Camera", ok(a.CameraStatus, ["Disconnected", "Connected"])),
-  ].join("");
+  const lab = (v, labels) => labels[v] ?? v;
+  const devs = [["UV LED sensor", d.TempSensorStatusOfUVLED, ["Disconnected", "Normal", "Abnormal"]],
+    ["Vat temp sensor", d.TankStatus, ["Disconnected", "Normal", "Abnormal"]],
+    ["LCD", d.LCDStatus, ["Disconnected", "Connected"]],
+    ["Strain gauge", d.SgStatus, ["Disconnected", "Normal", "Calibration failed"]],
+    ["Z motor", d.ZMotorStatus, ["Disconnected", "Connected"]],
+    ["X motor", d.XMotorStatus, ["Disconnected", "Connected"]],
+    ["Rotary motor", d.RotateMotorStatus, ["Disconnected", "Connected"]],
+    ["Release film", d.RelaseFilmState, ["Abnormal", "Normal"]],
+    ["Camera", a.CameraStatus, ["Disconnected", "Connected"]]];
+  $("deviceStats").innerHTML = devs.map(([k, v, l]) => kvo(k, v == null ? null : lab(v, l))).join("");
   $("attrStats").innerHTML = [
     kv("Model", a.MachineName), kv("Brand", a.BrandName), kv("Firmware", a.FirmwareVersion),
     kv("Protocol", a.ProtocolVersion), kv("Resolution", a.Resolution), kv("Build volume (mm)", a.XYZsize),
     kv("IP", a.MainboardIP), kv("Mainboard ID", S.mainboard_id), kv("Network", a.NetworkStatus),
     kv("USB drive", a.UsbDiskStatus ? "Connected" : "Not connected"),
-    kv("Camera streams", a.MaximumVideoStreamAllowed != null ? `${a.NumberOfVideoStreamConnected} / ${a.MaximumVideoStreamAllowed}` : null),
+    kvo("Camera clients", a.MaximumVideoStreamAllowed != null ? `${a.NumberOfVideoStreamConnected} / ${a.MaximumVideoStreamAllowed}` : null),
     kv("File types", (a.SupportFileType || []).join(", ")), kv("Capabilities", (a.Capabilities || []).join(", ")),
-    kv("Max UV LED temp", a.TempOfUVLEDMax ? a.TempOfUVLEDMax + " °C" : null),
-    kv("Free space", a.RemainingMemory ? fmtSize(a.RemainingMemory / 8) : null),
-    kv("Time-lapse start/height/interval", a.TLPStartCapPos != null ? `${a.TLPStartCapPos}mm / ${a.TLPNoCapPos}mm / ${a.TLPInterLayers} layers` : null),
+    kvo("Max UV LED temp", a.TempOfUVLEDMax ? a.TempOfUVLEDMax + " °C" : null),
+    kvo("Time-lapse start/height/interval", a.TLPStartCapPos != null ? `${a.TLPStartCapPos}mm / ${a.TLPNoCapPos}mm / ${a.TLPInterLayers} layers` : null),
+    kvo("Connection restarts this session", S.reconnects != null ? String(Math.max(S.reconnects - 1, 0)) : null),
   ].join("");
   if (document.activeElement !== $("inName")) $("inName").value = a.Name || "";
 }
@@ -182,7 +191,7 @@ $("tabs").addEventListener("click", (e) => {
   document.querySelectorAll(".tab").forEach((t) => t.classList.add("hidden"));
   $("tab-" + b.dataset.tab).classList.remove("hidden");
   if (b.dataset.tab === "history") loadHistory();
-  if (b.dataset.tab === "explorer" && !exLoaded) exGo($("exPath").value);
+  if (b.dataset.tab === "explorer" && !exLoaded) exStart();
 });
 
 // ------------------------------------------------------------------ files
@@ -191,6 +200,9 @@ async function loadFiles() {
   const j = await api("/api/files?path=" + encodeURIComponent(curPath));
   if (!j.ok) { $("fileList").innerHTML = `<div class="empty">${esc(j.message)}</div>`; return; }
   fileItems = j.files; selected.clear();
+  const nf = fileItems.filter((f) => f.fragment).length;
+  $("fragBar").classList.toggle("hidden", !nf);
+  $("fragText").textContent = `Show ${nf} incomplete upload${nf > 1 ? "s" : ""} (interrupted transfers, safe to delete)`;
   const sb = $("storageBar");
   if (j.storage && j.storage.total) {
     sb.classList.remove("hidden");
@@ -214,11 +226,12 @@ $("storageSeg").addEventListener("click", (e) => {
 });
 function renderFiles() {
   const q = $("fileFilter").value.toLowerCase();
-  const items = fileItems.filter((f) => f.name.toLowerCase().includes(q));
+  const items = fileItems.filter((f) => f.name.toLowerCase().includes(q) && (!f.fragment || $("showFrag").checked));
   if (!items.length) { $("fileList").innerHTML = '<div class="empty">No files here.</div>'; return; }
   $("fileList").innerHTML = items.map((f, i) => {
     const idx = fileItems.indexOf(f);
     if (f.is_dir) return `<div class="row-f"><input type="checkbox" data-i="${idx}"><div class="thumb">📁</div><div><div class="f-name dir" data-open="${idx}">${esc(f.name)}</div><div class="f-meta">Folder</div></div><div class="f-act"></div></div>`;
+    if (f.fragment) return `<div class="row-f"><input type="checkbox" data-i="${idx}"><div class="thumb">⚠</div><div><div class="f-name">${esc(f.name)}<span class="badge warn">Incomplete upload</span></div><div class="f-meta">${f.size ? `<span>Size <b>${fmtSize(f.size)}</b></span>` : ""}<span>Left behind by an interrupted transfer</span></div></div><div class="f-act"><button class="btn sm danger" data-del="${idx}">🗑</button></div></div>`;
     const meta = [];
     if (f.layer_height != null) meta.push(`<span>Layer height <b>${Number(f.layer_height).toFixed(2)} mm</b></span>`);
     if (f.layers != null) meta.push(`<span>Layers <b>${f.layers}</b></span>`);
@@ -226,11 +239,16 @@ function renderFiles() {
     if (f.size != null) meta.push(`<span>Size <b>${fmtSize(f.size)}</b></span>`);
     if (f.create_time) meta.push(`<span>Created <b>${esc(typeof f.create_time === "number" ? (ago(f.create_time) + " · " + fmtDate(f.create_time)) : f.create_time)}</b></span>`);
     meta.push(f.last_printed ? `<span>Last printed <b>${ago(f.last_printed)}</b>${f.print_count > 1 ? ` (${f.print_count}×)` : ""}</span>` : `<span>Never printed</span>`);
-    return `<div class="row-f"><input type="checkbox" data-i="${idx}">${thumbHtml(f.thumbnail)}<div><div class="f-name">${esc(f.name)}</div><div class="f-meta">${meta.join("")}</div></div>
+    return `<div class="row-f"><input type="checkbox" data-i="${idx}">${thumbHtml(f.thumbnail)}<div><div class="f-name">${esc(f.name)}${f.percent_codes ? '<span class="badge bad" title="The name contains %xx codes, so it was uploaded with the wrong name. Delete it and upload again with the fixed app.">name has % codes</span>' : ""}</div><div class="f-meta">${meta.join("")}</div></div>
       <div class="f-act"><button class="btn sm primary" data-print="${idx}">▶ Print</button><button class="btn sm danger" data-del="${idx}">🗑</button></div></div>`;
   }).join("");
 }
 $("fileFilter").addEventListener("input", renderFiles);
+$("showFrag").addEventListener("change", renderFiles);
+const delFrag = document.createElement("button");
+delFrag.className = "btn sm danger"; delFrag.textContent = "Delete incomplete uploads";
+delFrag.onclick = () => deleteItems(fileItems.filter((f) => f.fragment));
+$("fragBar").appendChild(delFrag);
 $("fileList").addEventListener("click", async (e) => {
   const t = e.target;
   if (t.dataset.open != null) { curPath = fileItems[t.dataset.open].path.replace(/\/?$/, "/"); loadFiles(); }
@@ -359,10 +377,29 @@ $("bFeed").onclick = () => act("/api/stop-feeding", {}, "Feeding stopped");
 $("btnRefreshAll").onclick = async () => { await act("/api/refresh", {}); loadFiles(); };
 $("btnRename").onclick = () => act("/api/rename", { name: $("inName").value }, "Renamed");
 $("tlSwitch").onchange = () => act("/api/timelapse", { enable: $("tlSwitch").checked }, "Time-lapse " + ($("tlSwitch").checked ? "enabled" : "disabled"));
-async function setLight(on) { const j = await act("/api/light", { on }, "Light " + (on ? "on" : "off")); return j; }
+async function setLight(on) {
+  $("lightNote").textContent = "Trying…";
+  const j = await api("/api/light", { on });
+  const tried = (j.results || []).map((r) => `${r.variant}: ${r.answered ? "Ack " + r.ack : "no answer"}`).join(", ");
+  $("lightNote").textContent = tried;
+  if (j.ok) toast("Light " + (on ? "on" : "off") + " (printer acknowledged)", "ok"); else toast(j.message || "Light command failed", "bad");
+  return j;
+}
 $("btnLight").onclick = () => setLight(!(S && S.light === true));
 $("lightOn").onclick = () => setLight(true);
 $("lightOff").onclick = () => setLight(false);
+$("pxApply").onclick = async () => {
+  const p = {}, num = (id) => $(id).value === "" ? null : Number($(id).value);
+  if (num("pxNormal") != null) p.NormalExposureTime = Math.round(num("pxNormal") * 1000);
+  if (num("pxBottom") != null) p.BottomExposureTime = Math.round(num("pxBottom") * 1000);
+  if (num("pxLayers") != null) p.BottomLayer = Math.round(num("pxLayers"));
+  if (!Object.keys(p).length) return toast("Enter at least one value", "bad");
+  $("pxOut").textContent = "Sending…";
+  const j = await api("/api/print-params", { params: p });
+  $("pxOut").textContent = (j.results || []).map((r) => `${r.key}=${r.value}: ${r.answered ? "Ack " + r.ack : "no answer"}`).join("   ") || j.message || "";
+  toast(j.ok ? "Print settings changed" : (j.message || "Failed"), j.ok ? "ok" : "bad");
+};
+$("camRelease").onclick = async () => { camStop(); await act("/api/camera/release", {}, "Camera released"); };
 $("btnDiscover").onclick = async () => {
   $("discoverOut").textContent = "Scanning…";
   const j = await api("/api/discover", {});
@@ -400,64 +437,137 @@ $("lgClear").onclick = () => { logEntries.length = 0; lv.textContent = ""; };
 const logText = () => logEntries.filter(logVisible).map((e) => `${new Date(e.t * 1000).toISOString()} ${e.dir === "out" ? "->" : e.dir === "in" ? "<-" : "**"} ${e.text}` + (e.msg && $("lgRaw").checked ? " " + JSON.stringify(e.msg) : "")).join("\n");
 $("lgCopy").onclick = () => navigator.clipboard.writeText(logText()).then(() => toast("Log copied", "ok"), () => toast("Copy failed", "bad"));
 $("lgSave").onclick = () => { const a = document.createElement("a"); a.href = URL.createObjectURL(new Blob([logText()], { type: "text/plain" })); a.download = "saturn-log.txt"; a.click(); };
+const hex32 = () => [...crypto.getRandomValues(new Uint8Array(16))].map((x) => x.toString(16).padStart(2, "0")).join("");
+function envelope(cmd, data, extra) {
+  const mb = S ? S.mainboard_id : "";
+  return JSON.stringify({ Id: S ? S.brand_id : "", Data: { Cmd: cmd, ...(extra || {}), Data: data || {}, RequestID: hex32(), MainboardID: mb, TimeStamp: Math.floor(Date.now() / 1000), From: 0 }, Topic: "sdcp/request/" + mb }, null, 1);
+}
+const machineName = () => (S && S.attributes && S.attributes.MachineName) || "Saturn 4 Ultra 16K";
+const RAW_PRESETS = {
+  "Cmd 0 - status": () => envelope(0),
+  "Cmd 1 - attributes": () => envelope(1),
+  "Light ON (151)": () => envelope(151, { ControlState: 1 }),
+  "Light OFF (151)": () => envelope(151, { ControlState: 0 }),
+  "Light ON with Matrix fields": () => envelope(151, { ControlState: 1 }, { Belong: "LCD", ProVer: "0.0.1", MachineType: machineName() }),
+  "Normal exposure 1.7 s (135)": () => envelope(135, { NormalExposureTime: 1700.0 }),
+  "Bottom exposure 45 s (135)": () => envelope(135, { BottomExposureTime: 45000.0 }),
+  "Bottom layers 7 (135)": () => envelope(135, { BottomLayer: 7 }),
+  "Pause (129)": () => envelope(129),
+  "Resume (131)": () => envelope(131),
+  "File list /local/ (258)": () => envelope(258, { Url: "/local/" }),
+  "Plain text: ping": () => "ping",
+};
+$("rawPreset").innerHTML += Object.keys(RAW_PRESETS).map((k) => `<option>${esc(k)}</option>`).join("");
+$("rawPreset").onchange = () => { const f = RAW_PRESETS[$("rawPreset").value]; if (f) $("rawLine").value = f(); $("rawPreset").selectedIndex = 0; $("rawLine").focus(); };
+$("rawFill").onclick = () => { const n = $("rawCmd").value; if (n === "") return toast("Type a command number first", "bad"); $("rawLine").value = envelope(Number(n)); $("rawLine").focus(); };
 async function sendRaw() {
-  const m = $("rawLine").value.trim().match(/^(\d+)\s*(.*)$/);
-  if (!m) return toast("Format: <cmd number> [JSON data]", "bad");
-  let data = {}; if (m[2]) { try { data = JSON.parse(m[2]); } catch { return toast("Data is not valid JSON", "bad"); } }
-  const j = await api("/api/raw", { cmd: +m[1], data });
-  if (!j.ok) toast(j.message, "bad");
-  $("rawLine").value = "";
+  const text = $("rawLine").value;
+  if (!text.trim()) return;
+  const j = await api("/api/raw", { text });
+  if (!j.ok) return toast(j.message || "Send failed", "bad");
+  if (j.reply) toast("Printer replied: " + (j.reply.Data && j.reply.Data.Ack != null ? "Ack " + j.reply.Data.Ack : "see Console"), "ok");
+  else toast(j.note || "Sent", "");
 }
 $("rawSend").onclick = sendRaw;
-$("rawLine").addEventListener("keydown", (e) => { if (e.key === "Enter") sendRaw(); });
+$("rawLine").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendRaw(); } });
 
-// ------------------------------------------------------------------ explorer
-let exLoaded = false; const exReport = [];
-const joinPath = (base, name) => (base.replace(/\/+$/, "") + "/" + name.replace(/^\/+/, ""));
-async function exGo(path) {
-  exLoaded = true; $("exPath").value = path;
+// ------------------------------------------------------------------ explorer (printer's HTTP file server)
+let exLoaded = false, exCur = "/", exHist = [], exPos = -1, exEntries = [], exSort = { key: "name", asc: true };
+const exCache = new Map(), exOpen = new Set(["/"]);
+const EX_QUICK = [["Print files", "/media/mmcblk0p3/"], ["Thumbnails + file_info", "/media/mmcblk0p1/file_info/"], ["Logs", "/media/mmcblk0p2/"], ["Config", "/config/"], ["Customer", "/customer/"], ["Root", "/"]];
+const TEXT_EXT = /\.(txt|log|ini|conf|cfg|json|xml|csv|md|sh|properties|yaml|yml|lua|py|js|html|htm|css)$/i, IMG_EXT = /\.(bmp|png|jpe?g|gif)$/i;
+const exUrl = (p, dl) => "/api/fetch?u=" + encodeURIComponent(p) + (dl ? "&download=1" : "");
+async function exList(path, fresh) {
+  if (!fresh && exCache.has(path)) return exCache.get(path);
+  const j = await api("/api/http/list?path=" + encodeURIComponent(path));
+  if (j.ok) exCache.set(path, j);
+  return j;
+}
+function exStart() {
+  exLoaded = true;
+  $("exQuick").innerHTML = EX_QUICK.map(([n, p]) => `<button class="btn sm" data-q="${esc(p)}">${esc(n)}</button>`).join("");
+  exGo("/media/mmcblk0p3/");
+}
+async function exGo(path, mode) {          // mode: undefined = new navigation, "hist" = back/forward, "fresh" = refresh
   $("exList").innerHTML = '<div class="empty">Loading…</div>';
-  const j = await api("/api/explore?path=" + encodeURIComponent(path));
-  exReport.push(`LIST ${path}\n${JSON.stringify(j, null, 1)}`);
-  $("exRaw").textContent = JSON.stringify(j, null, 2);
-  const list = (j.reply && j.reply.FileList) || [];
-  if (!j.ok && !list.length) { $("exList").innerHTML = `<div class="empty">${esc(j.message || "Printer refused this path (Ack " + (j.reply && j.reply.Ack) + ")")}</div>`; return; }
-  if (!list.length) { $("exList").innerHTML = '<div class="empty">Empty.</div>'; return; }
-  $("exList").innerHTML = list.map((e, i) => {
-    const dir = e.type === 0 || e.type === "0"; const nm = e.name || e.Name || "?";
-    const extra = Object.keys(e).filter((k) => !["name", "type"].includes(k)).map((k) => `${esc(k)}=${esc(JSON.stringify(e[k]))}`).join("  ");
-    return `<div class="row-f" style="grid-template-columns:28px 1fr auto"><div>${dir ? "📁" : "🗎"}</div><div><div class="f-name ${dir ? "dir" : ""}" ${dir ? `data-go="${i}"` : ""}>${esc(nm)}</div><div class="f-meta mono">${extra || "type=" + e.type}</div></div><div class="f-act">${dir ? "" : `<button class="btn sm" data-probe="${i}">Probe HTTP</button>`}</div></div>`;
-  }).join("");
-  $("exList")._list = list;
+  const j = await exList(path, mode === "fresh");
+  if (!j.ok) { $("exList").innerHTML = `<div class="empty">${esc(j.message)}</div>`; exEntries = []; $("exInfo").textContent = ""; return; }
+  exCur = j.path;
+  if (!mode) { exHist = exHist.slice(0, exPos + 1); if (exHist[exHist.length - 1] !== exCur) exHist.push(exCur); exPos = exHist.length - 1; }
+  exEntries = j.entries;
+  exOpenTo(exCur);
+  renderEx(j);
 }
-$("exList").addEventListener("click", (e) => {
-  const l = $("exList")._list || [];
-  if (e.target.dataset.go != null) exGo((l[e.target.dataset.go].name || "").replace(/\/?$/, "/"));
-  if (e.target.dataset.probe != null) { $("prPath").value = l[e.target.dataset.probe].name; prGo(); }
+function exOpenTo(path) { let acc = "/"; exOpen.add("/"); for (const seg of path.split("/").filter(Boolean)) { acc += seg + "/"; exOpen.add(acc); } renderTree(); }
+function renderEx(j) {
+  $("exBack").disabled = exPos <= 0; $("exFwd").disabled = exPos >= exHist.length - 1; $("exUp").disabled = exCur === "/";
+  const segs = exCur.split("/").filter(Boolean); let acc = "/";
+  $("exCrumbs").innerHTML = `<a data-p="/">printer</a>` + segs.map((sg) => { acc += sg + "/"; return ` / <a data-p="${esc(acc)}">${esc(sg)}</a>`; }).join("");
+  const k = exSort.key, dir = exSort.asc ? 1 : -1;
+  const list = [...exEntries].sort((x, y) => (x.is_dir === y.is_dir ? 0 : x.is_dir ? -1 : 1) || dir * (k === "name" ? x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: "base" }) : ((x[k] ?? -1) - (y[k] ?? -1))));
+  document.querySelectorAll("#exHead span[data-sort]").forEach((e) => { e.className = e.dataset.sort === k ? "sorted" + (exSort.asc ? " asc" : "") : ""; });
+  $("exList").innerHTML = list.length ? list.map((e) => {
+    const i = exEntries.indexOf(e);
+    const when = e.mtime ? fmtDate(e.mtime) : "–";
+    const acts = e.is_dir ? "" : (e.readable
+      ? `${TEXT_EXT.test(e.name) || IMG_EXT.test(e.name) ? `<button class="btn sm" data-view="${i}" title="View">👁</button>` : ""}<a class="btn sm" href="${esc(exUrl(e.path, true))}" title="Download">⬇</a>`
+      : "");
+    return `<div class="ex-row"><div class="ex-name ${e.is_dir ? "dir" : ""}" ${e.is_dir ? `data-go="${i}"` : ""}>${e.is_dir ? "📁" : "🗎"} ${esc(e.name)}</div><div class="when">${when}</div><div class="num">${e.is_dir ? "" : e.size == null ? "–" : fmtSize(e.size)}</div><div class="ex-act">${acts}</div></div>`;
+  }).join("") : '<div class="empty">Empty folder.</div>';
+  const files = exEntries.filter((e) => !e.is_dir), tot = files.reduce((a, e) => a + (e.size || 0), 0);
+  $("exInfo").textContent = `${exEntries.length - files.length} folder(s), ${files.length} file(s), ${fmtSize(tot)}` + (j.virtual ? " · virtual system folder: viewing and downloading files here is blocked" : "") + (j.note ? " · " + j.note : "");
+}
+function renderTree() {
+  const node = (path, name, depth) => {
+    const open = exOpen.has(path), cached = exCache.get(path);
+    let h = `<div class="tn ${path === exCur ? "cur" : ""}" data-tp="${esc(path)}" style="padding-left:${4 + depth * 2}px"><span class="tw" data-tt="${esc(path)}">${open ? "▾" : "▸"}</span><span data-tg="${esc(path)}">📁 ${esc(name)}</span></div>`;
+    if (open && cached) h += '<div class="tkids">' + cached.entries.filter((e) => e.is_dir).map((e) => node(e.path, e.name, depth + 1)).join("") + "</div>";
+    return h;
+  };
+  $("exTree").innerHTML = node("/", "printer", 0);
+}
+$("exTree").addEventListener("click", async (e) => {
+  const t = e.target.dataset;
+  if (t.tt != null) {
+    if (exOpen.has(t.tt) && t.tt !== "/") exOpen.delete(t.tt); else { exOpen.add(t.tt); await exList(t.tt); }
+    renderTree();
+  } else if (t.tg != null) exGo(t.tg);
 });
-$("exGo").onclick = () => exGo($("exPath").value);
-$("exPath").addEventListener("keydown", (e) => { if (e.key === "Enter") exGo($("exPath").value); });
-$("exUp").onclick = () => { const p = $("exPath").value.replace(/\/+$/, ""); exGo(p.slice(0, p.lastIndexOf("/") + 1) || "/"); };
-$("exQuick").innerHTML = ["/", "/local/", "/usb/", "/local/.", "/local/..", "/sdcard/", "/mnt/", "/etc/"].map((p) => `<button class="btn sm" data-q="${p}">${p}</button>`).join("");
+$("exCrumbs").addEventListener("click", (e) => { const a = e.target.closest("a"); if (a) exGo(a.dataset.p); });
 $("exQuick").addEventListener("click", (e) => { if (e.target.dataset.q) exGo(e.target.dataset.q); });
-async function prGo() {
-  const j = await api(`/api/probe?port=${$("prPort").value}&path=${encodeURIComponent($("prPath").value)}`);
-  exReport.push(`PROBE ${$("prPort").value} ${$("prPath").value}\n${JSON.stringify(j, null, 1)}`);
-  $("prOut").textContent = JSON.stringify({ ...j, links: undefined }, null, 2);
-  $("prLinks").innerHTML = (j.links || []).map((l, i) => `<button class="btn sm" data-l="${i}">${esc(l)}</button>`).join("");
-  $("prLinks")._links = j.links || []; $("prLinks")._base = $("prPath").value;
-}
-$("prLinks").addEventListener("click", (e) => {
-  if (e.target.dataset.l == null) return;
-  const l = $("prLinks")._links[e.target.dataset.l], base = $("prLinks")._base;
-  $("prPath").value = l.startsWith("/") ? l : base.replace(/\/?$/, "/") + l; prGo();
+$("exBack").onclick = () => { if (exPos > 0) { exPos--; exGo(exHist[exPos], "hist"); } };
+$("exFwd").onclick = () => { if (exPos < exHist.length - 1) { exPos++; exGo(exHist[exPos], "hist"); } };
+$("exUp").onclick = () => { const p = exCur.replace(/\/+$/, ""); exGo(p.slice(0, p.lastIndexOf("/") + 1) || "/"); };
+$("exRefresh").onclick = async () => { exCache.delete(exCur); exCache.forEach((v, k) => { if (k !== exCur && exOpen.has(k)) exCache.delete(k); }); await exGo(exCur, "fresh"); for (const p of exOpen) if (!exCache.has(p)) await exList(p); renderTree(); };
+$("exHead").addEventListener("click", (e) => { const k = e.target.dataset.sort; if (!k) return; exSort = { key: k, asc: exSort.key === k ? !exSort.asc : true }; renderEx({ virtual: false }); });
+$("exList").addEventListener("click", async (e) => {
+  const d = e.target.dataset;
+  if (d.go != null) return exGo(exEntries[d.go].path);
+  if (d.view == null) return;
+  const en = exEntries[d.view];
+  const dlg = ensureViewer(); $("vwTitle").textContent = en.path; $("vwBody").innerHTML = "Loading…"; dlg.showModal();
+  if (IMG_EXT.test(en.name)) { $("vwBody").innerHTML = `<img src="${esc(exUrl(en.path))}" style="max-width:100%;max-height:60vh;display:block;margin:10px auto">`; return; }
+  try {
+    const r = await fetch(exUrl(en.path), { headers: { Range: "bytes=0-262143" } });
+    const txt = await r.text();
+    const pre = document.createElement("pre"); pre.textContent = r.ok || r.status === 206 ? txt : "Could not read: " + txt;
+    $("vwBody").textContent = ""; $("vwBody").append(pre);
+    if (en.size > 262144) { const n = document.createElement("div"); n.className = "muted"; n.textContent = `Showing the first 256 KB of ${fmtSize(en.size)}. Use download for the whole file.`; $("vwBody").append(n); }
+  } catch (err) { $("vwBody").textContent = "Could not read the file: " + err; }
 });
-$("prGo").onclick = prGo;
-$("exReport").onclick = () => navigator.clipboard.writeText(exReport.join("\n\n")).then(() => toast("Report copied (" + exReport.length + " results)", "ok"), () => toast("Copy failed", "bad"));
+function ensureViewer() {
+  let d = $("viewDlg");
+  if (!d) {
+    d = document.createElement("dialog"); d.id = "viewDlg"; d.className = "viewer";
+    d.innerHTML = '<h3 id="vwTitle" class="mono" style="word-break:break-all"></h3><div id="vwBody"></div><menu><button class="btn" id="vwClose">Close</button></menu>';
+    document.body.appendChild(d); d.querySelector("#vwClose").onclick = () => d.close();
+  }
+  return d;
+}
 
 // ------------------------------------------------------------------ boot
 fetch("/api/config").then((r) => r.json()).then((c) => {
-  if (!c.light_enabled) { $("btnLight").classList.add("hidden"); document.querySelectorAll(".lightRow").forEach((e) => e.classList.add("hidden")); }
+  cfgLight = !!c.light_enabled; if (S) render();
 });
 connectWS();
 fetch("/api/state").then((r) => r.json()).then((s) => { S = s; render(); });
