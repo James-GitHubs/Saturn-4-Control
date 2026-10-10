@@ -148,3 +148,7 @@ dialog menu{display:flex;justify-content:flex-end;gap:8px;padding:0;margin:18px 
 .viewer pre{max-height:60vh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;margin:10px 0 0}
 .logcmd textarea{resize:vertical;min-height:38px}
 .logcmd select{max-width:170px}
+
+.tweaks{display:grid;gap:8px;max-width:420px}
+.tw-row{display:grid;grid-template-columns:130px 110px auto;gap:8px;align-items:center}
+.tw-row input:disabled{opacity:.7;cursor:not-allowed}

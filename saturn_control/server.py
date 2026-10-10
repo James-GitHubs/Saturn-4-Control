@@ -551,13 +551,15 @@ def create_app(cfg=None):
             if not ff:
                 raise PrinterError("Printer offers an RTSP stream (%s) but no ffmpeg was found; "
                                    "run: .venv\\Scripts\\pip install imageio-ffmpeg" % url)
-            attempts = [("tcp", ["-fflags", "nobuffer", "-flags", "low_delay"]), ("tcp", []), ("udp", [])]
+            # No "nobuffer/low_delay" and no frame-rate resampling: those smear motion into blocks.
+            attempts = [("tcp", ["-fflags", "+genpts", "-max_delay", "1000000", "-probesize", "2000000", "-analyzeduration", "2000000"]),
+                        ("tcp", []), ("udp", [])]
             errors = []
             for transport, extra in attempts:
                 proc = await asyncio.create_subprocess_exec(
                     ff, "-hide_banner", "-loglevel", "warning", *extra,
                     "-rtsp_transport", transport, "-i", url,
-                    "-an", "-r", "10", "-q:v", "5", "-f", "mpjpeg", "-",
+                    "-an", "-q:v", str(printer().cfg.get("camera_quality", 2)), "-f", "mpjpeg", "-",
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
                 got = False

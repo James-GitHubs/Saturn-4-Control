@@ -188,6 +188,8 @@ class PrinterClient:
         self._fi = (0, {})
         self.upload = None          # dict describing the current/last upload
         self.light = None           # optimistic light state (True/False/None)
+        self.known_params = {}      # print settings this app changed (the local protocol does not report them)
+        self.known_task = None
         self.video_url = None
         self.video_enabled = False
         self.last_message = 0
@@ -463,16 +465,23 @@ class PrinterClient:
         websocket may not support it at all, so this reports exactly what the printer did."""
         state = 1 if on else 0
         machine = (self.attributes or {}).get("MachineName") or "Saturn 4 Ultra 16K"
+        lamp = {"SecondLight": state, "RgbLight": [0, 0, 0]}
         variants = [
             ("plain", self.envelope(CMD["LIGHT"], {"ControlState": state})),
             ("matrix-fields", self.envelope(CMD["LIGHT"], {"ControlState": state},
                                             {"Belong": "LCD", "ProVer": "0.0.1", "MachineType": machine})),
+            ("matrix-0.0.2", self.envelope(CMD["LIGHT"], {"ControlState": state},
+                                           {"Belong": "LCD", "ProVer": "0.0.2", "MachineType": machine})),
+            ("bool", self.envelope(CMD["LIGHT"], {"ControlState": bool(state)})),
+            ("lightstatus-151", self.envelope(CMD["LIGHT"], {"LightStatus": lamp})),
+            ("cmd-403", self.envelope(403, {"LightStatus": lamp})),
+            ("cmd-403-simple", self.envelope(403, {"LightStatus": {"SecondLight": state}})),
         ]
         if self.light_variant:        # one that worked before goes first
             variants.sort(key=lambda v: v[0] != self.light_variant)
         results = []
         for name, msg in variants:
-            r = await self.send_raw(json.dumps(msg), wait=3.0)
+            r = await self.send_raw(json.dumps(msg), wait=2.0)
             ack = ((r.get("reply") or {}).get("Data") or {}).get("Ack")
             results.append({"variant": name, "answered": r.get("reply") is not None, "ack": ack})
             if r.get("reply") is not None:
@@ -489,6 +498,9 @@ class PrinterClient:
             try:
                 d = await self.request(CMD["CHANGE_PARAMS"], {k: v}, timeout=4)
                 out.append({"key": k, "value": v, "answered": True, "ack": d.get("Ack")})
+                if d.get("Ack") == 0:
+                    self.known_params[k] = v
+                    self.on_change()
             except PrinterError as e:
                 out.append({"key": k, "value": v, "answered": False, "error": str(e)})
         return out
@@ -669,6 +681,28 @@ class PrinterClient:
             pass
 
     # ------------------------------------------------------------ view
+    def _print_params(self):
+        """Current exposure settings: whatever the printer reports locally, else what this app last set
+        for the running task. {} / missing keys when unknown (the local protocol does not report them)."""
+        st = self.status or {}
+        pi = st.get("PrintInfo") or {}
+        task = pi.get("TaskId") or ""
+        if task != self.known_task:
+            self.known_task, self.known_params = task, {}
+        out = {}
+        for key, names in (("NormalExposureTime", ("ExposureTimeNormal", "NormalExposureTime", "ExposureTime")),
+                           ("BottomExposureTime", ("ExposureTimeBottom", "BottomExposureTime")),
+                           ("BottomLayer", ("BottomLayer", "BottomLayerCount"))):
+            for src in (pi, st):
+                v = next((src[n] for n in names if src.get(n) is not None), None)
+                if v is not None:
+                    out[key] = v
+                    break
+            else:
+                if key in self.known_params:
+                    out[key] = self.known_params[key]
+        return out
+
     def public_state(self):
         st = self.status or {}
         pi = st.get("PrintInfo") or {}
@@ -692,6 +726,7 @@ class PrinterClient:
             "remaining_ms": max(total_t - cur_t, 0) if total_t else None,
             "upload": self.upload,
             "light": self.light,
+            "print_params": self._print_params(),
             "light_variant": self.light_variant,
             "reconnects": self.reconnects,
             "brand_id": self.brand_id,

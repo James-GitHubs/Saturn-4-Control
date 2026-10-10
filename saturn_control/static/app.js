@@ -105,6 +105,7 @@ function render(serverDown) {
   const je = $("jobError");
   if (S.print_error) { je.textContent = S.print_error; je.classList.remove("hidden"); } else je.classList.add("hidden");
 
+  renderTweaks();
   // light + timelapse
   $("btnLight").classList.toggle("hidden", !(cfgLight || S.light_variant));
   $("btnLight").classList.toggle("on", S.light === true);
@@ -388,17 +389,29 @@ async function setLight(on) {
 $("btnLight").onclick = () => setLight(!(S && S.light === true));
 $("lightOn").onclick = () => setLight(true);
 $("lightOff").onclick = () => setLight(false);
-$("pxApply").onclick = async () => {
-  const p = {}, num = (id) => $(id).value === "" ? null : Number($(id).value);
-  if (num("pxNormal") != null) p.NormalExposureTime = Math.round(num("pxNormal") * 1000);
-  if (num("pxBottom") != null) p.BottomExposureTime = Math.round(num("pxBottom") * 1000);
-  if (num("pxLayers") != null) p.BottomLayer = Math.round(num("pxLayers"));
-  if (!Object.keys(p).length) return toast("Enter at least one value", "bad");
+const TW = { NormalExposureTime: { el: "twNormal", label: "Normal exposure", unit: "seconds", ms: true },
+  BottomExposureTime: { el: "twBottom", label: "Bottom exposure", unit: "seconds", ms: true },
+  BottomLayer: { el: "twLayers", label: "Bottom layers", unit: "layers", ms: false } };
+function renderTweaks() {
+  const pp = (S && S.print_params) || {};
+  for (const [k, t] of Object.entries(TW)) {
+    const v = pp[k];
+    $(t.el).value = v == null ? "unknown" : t.ms ? (v / 1000) + " s" : String(v);
+  }
+}
+$("tweaks").addEventListener("click", async (e) => {
+  const key = e.target.dataset.tw; if (!key) return;
+  const t = TW[key], cur = ((S && S.print_params) || {})[key];
+  const d = await confirmDialog(`<h3>Edit ${t.label.toLowerCase()}</h3><p class="muted">Sent to the printer immediately when you press Apply. Value in ${t.unit}.</p><input class="input" id="twNew" type="number" min="0" step="${t.ms ? 0.1 : 1}" value="${cur == null ? "" : t.ms ? cur / 1000 : cur}" autofocus>`, "Apply");
+  if (!d) return;
+  const raw = $("twNew").value; if (raw === "") return toast("No value entered", "bad");
+  const n = Number(raw); if (!isFinite(n) || n < 0) return toast("Invalid value", "bad");
+  const value = t.ms ? Math.round(n * 1000) : Math.round(n);
   $("pxOut").textContent = "Sending…";
-  const j = await api("/api/print-params", { params: p });
+  const j = await api("/api/print-params", { params: { [key]: value } });
   $("pxOut").textContent = (j.results || []).map((r) => `${r.key}=${r.value}: ${r.answered ? "Ack " + r.ack : "no answer"}`).join("   ") || j.message || "";
-  toast(j.ok ? "Print settings changed" : (j.message || "Failed"), j.ok ? "ok" : "bad");
-};
+  toast(j.ok ? `${t.label} changed` : (j.message || "Failed"), j.ok ? "ok" : "bad");
+});
 $("camRelease").onclick = async () => { camStop(); await act("/api/camera/release", {}, "Camera released"); };
 $("btnDiscover").onclick = async () => {
   $("discoverOut").textContent = "Scanning…";
@@ -411,6 +424,7 @@ const logEntries = [];
 const lv = $("logView");
 const hhmmss = (t) => new Date(t * 1000).toLocaleTimeString([], { hour12: false }) + "." + String(Math.floor((t % 1) * 1000)).padStart(3, "0");
 function logVisible(e) {
+  if (e.kind === "change" && $("lgHideState").checked && /PrintInfo\.Status: /.test(e.text)) return false;
   if (e.kind === "status" || e.kind === "attributes") return $("lgStatus").checked;
   if (e.kind === "debug") return $("lgDebug").checked;
   return true;
@@ -432,7 +446,7 @@ function logAdd(entries, init) {
   if (stick || init) lv.scrollTop = lv.scrollHeight;
 }
 function logRebuild() { lv.textContent = ""; for (const e of logEntries) if (logVisible(e)) lv.appendChild(logLine(e)); lv.scrollTop = lv.scrollHeight; }
-["lgStatus", "lgDebug", "lgRaw"].forEach((id) => $(id).addEventListener("change", logRebuild));
+["lgStatus", "lgHideState", "lgDebug", "lgRaw"].forEach((id) => $(id).addEventListener("change", logRebuild));
 $("lgClear").onclick = () => { logEntries.length = 0; lv.textContent = ""; };
 const logText = () => logEntries.filter(logVisible).map((e) => `${new Date(e.t * 1000).toISOString()} ${e.dir === "out" ? "->" : e.dir === "in" ? "<-" : "**"} ${e.text}` + (e.msg && $("lgRaw").checked ? " " + JSON.stringify(e.msg) : "")).join("\n");
 $("lgCopy").onclick = () => navigator.clipboard.writeText(logText()).then(() => toast("Log copied", "ok"), () => toast("Copy failed", "bad"));

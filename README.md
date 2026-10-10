@@ -13,6 +13,7 @@ A local web UI (Fluidd-style) for an Elegoo Saturn 4 Ultra, using Elegoo's SDCP 
 - `web_host` - `127.0.0.1` = this PC only. Use `0.0.0.0` to open it from your phone/other PCs on the LAN (no password, so LAN only).
 - `web_port`, `printer_port` (3030), `video_port` (3031), `udp_port` (3000), `mainboard_id` (auto-detected).
 - `light_enabled` - `false` (default) hides the header light button. The Printer tab always has an experimental light test.
+- `camera_quality` (2) - ffmpeg JPEG quality for the RTSP camera, 2 = best, 31 = worst.
 - `keepalive_seconds` (12) / `keepalive_timeout` (8) - how often the app polls the printer (Cmd 0) to keep the websocket from being dropped; 2 missed polls reconnect.
 
 ## Features

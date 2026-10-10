@@ -132,11 +132,10 @@
           <label>Light (Cmd 151)</label>
           <div class="row"><button class="btn" id="lightOn">Turn on</button><button class="btn" id="lightOff">Turn off</button><span class="muted" id="lightNote"></span></div>
           <label>Live print tweaks (Cmd 135, while a print is running)</label>
-          <div class="row">
-            <label class="chk">Normal exposure (s) <input class="input narrow" id="pxNormal" type="number" step="0.1" min="0"></label>
-            <label class="chk">Bottom exposure (s) <input class="input narrow" id="pxBottom" type="number" step="0.1" min="0"></label>
-            <label class="chk">Bottom layers <input class="input narrow" id="pxLayers" type="number" step="1" min="0"></label>
-            <button class="btn" id="pxApply">Apply</button>
+          <div class="tweaks" id="tweaks">
+            <div class="tw-row"><span>Normal exposure</span><input class="input narrow" id="twNormal" disabled><button class="btn sm" data-tw="NormalExposureTime">Edit</button></div>
+            <div class="tw-row"><span>Bottom exposure</span><input class="input narrow" id="twBottom" disabled><button class="btn sm" data-tw="BottomExposureTime">Edit</button></div>
+            <div class="tw-row"><span>Bottom layers</span><input class="input narrow" id="twLayers" disabled><button class="btn sm" data-tw="BottomLayer">Edit</button></div>
           </div>
           <div class="muted" id="pxOut"></div>
         </div>
@@ -192,6 +191,7 @@
   <div class="card-h wrap">
     <h2>Console</h2>
     <label class="chk"><input type="checkbox" id="lgStatus"> status updates</label>
+    <label class="chk"><input type="checkbox" id="lgHideState" checked> hide routine print-state changes</label>
     <label class="chk"><input type="checkbox" id="lgDebug"> keep-alive / chunks</label>
     <label class="chk"><input type="checkbox" id="lgRaw"> raw JSON</label>
     <div class="spacer"></div>
