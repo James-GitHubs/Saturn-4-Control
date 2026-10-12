@@ -168,15 +168,17 @@ function renderMessages() {
   $("msgList").innerHTML = items.length ? items.map(([k, e]) => `<div><b>${k}</b> <span class="muted">${new Date(e.t * 1000).toLocaleTimeString()}</span> ${esc(JSON.stringify(e.data))}</div>`).join("") : '<div class="muted">No messages</div>';
 }
 function renderUpload(u) {
-  const box = $("uploadBox");
-  if (!u || u.phase === "done" && Date.now() / 1000 - (u.finished || 0) > 6 || (u.phase === "cancelled")) { box.classList.add("hidden"); }
-  else {
-    box.classList.remove("hidden");
-    $("upName").textContent = u.name;
-    const pct = u.total ? (u.sent / u.total) * 100 : 0;
-    $("upBar").style.width = pct + "%"; $("upPct").textContent = Math.round(pct) + "%";
-    $("upPhase").textContent = { sending: "Sending to printer…", verifying: "Printer verifying…", done: "Uploaded ✓", error: "Failed" }[u.phase] + (u.error ? " – " + u.error : "");
-    $("upCancel").classList.toggle("hidden", !["sending", "verifying"].includes(u.phase));
+  for (const [boxId, pre] of [["uploadBox", "up"], ["rnUploadBox", "rnUp"]]) {
+    const box = $(boxId);
+    if (!u || u.phase === "done" && Date.now() / 1000 - (u.finished || 0) > 6 || (u.phase === "cancelled")) { box.classList.add("hidden"); }
+    else {
+      box.classList.remove("hidden");
+      $(pre + "Name").textContent = u.name;
+      const pct = u.total ? (u.sent / u.total) * 100 : 0;
+      $(pre + "Bar").style.width = pct + "%"; $(pre + "Pct").textContent = Math.round(pct) + "%";
+      $(pre + "Phase").textContent = { sending: "Sending to printer…", verifying: "Printer verifying…", done: "Uploaded ✓", error: "Failed" }[u.phase] + (u.error ? " – " + u.error : "");
+      $(pre + "Cancel").classList.toggle("hidden", !["sending", "verifying"].includes(u.phase));
+    }
   }
   if (u && u.phase !== lastUploadPhase) {
     if (u.phase === "done") { toast(`Uploaded ${u.name}`, "ok"); loadFiles(); }
@@ -193,6 +195,7 @@ $("tabs").addEventListener("click", (e) => {
   $("tab-" + b.dataset.tab).classList.remove("hidden");
   if (b.dataset.tab === "history") loadHistory();
   if (b.dataset.tab === "explorer" && !exLoaded) exStart();
+  if (b.dataset.tab === "render") rnStart();
 });
 
 // ------------------------------------------------------------------ files
@@ -267,10 +270,13 @@ $("btnRawFiles").onclick = () => {
   navigator.clipboard.writeText(raw).then(() => toast("Raw file list copied (" + fileItems.length + " entries)", "ok"), () => { toast("Copy failed", "bad"); });
 };
 $("btnSettings").onclick = async () => {
-  const d = await confirmDialog(`<h3>App settings</h3><label>Printer IP address<br><input class="input" id="setIp" value="${esc(S ? S.printer_ip : "")}" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. The app reconnects straight away.</p>`, "Save");
+  const d = await confirmDialog(`<h3>App settings</h3><label>Printer IP address<br><input class="input" id="setIp" value="${esc(S ? S.printer_ip : "")}" style="margin-top:6px;width:100%"></label><label style="display:block;margin-top:12px">Render Upload folder (on this PC)<br><input class="input" id="setRender" value="${esc(rnFolder)}" placeholder="E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. The app reconnects straight away.</p>`, "Save");
   if (!d) return;
-  const j = await act("/api/settings", { printer_ip: $("setIp").value }, "Saved. Reconnecting…");
-  if (j.ok) setTimeout(loadFiles, 2500);
+  const j = await act("/api/settings", { printer_ip: $("setIp").value, render_folder: $("setRender").value }, "Saved. Reconnecting…");
+  if (j.ok) {
+    if (j.render_folder !== rnFolder) { rnFolder = j.render_folder; rnReset(); if (!$("tab-render").classList.contains("hidden")) rnStart(); }
+    setTimeout(loadFiles, 2500);
+  }
 };
 $("btnDeleteSel").onclick = () => deleteItems([...selected].map((i) => fileItems[i]));
 async function deleteItems(items) {
@@ -327,7 +333,7 @@ function sendOne(file, printAfter) {
     x.send(fd);
   });
 }
-$("upCancel").onclick = () => act("/api/upload/cancel", {}, "Upload cancelled");
+$("upCancel").onclick = $("rnUpCancel").onclick = () => act("/api/upload/cancel", {}, "Upload cancelled");
 
 // ------------------------------------------------------------------ history
 async function loadHistory() {
@@ -579,9 +585,93 @@ function ensureViewer() {
   return d;
 }
 
+// ------------------------------------------------------------------ render upload (local folder of .goo files)
+let rnFolder = "", rnLoaded = false, rnCur = "", rnHist = [], rnPos = -1, rnEntries = [], rnSort = { key: "name", asc: true };
+const rnCache = new Map(), rnOpen = new Set([""]);
+const rnJoin = (rel) => rnFolder.replace(/[\\/]+$/, "") + (rel ? "\\" + rel.replace(/\//g, "\\") : "");
+function rnReset() { rnLoaded = false; rnCur = ""; rnHist = []; rnPos = -1; rnEntries = []; rnCache.clear(); rnOpen.clear(); rnOpen.add(""); }
+async function rnList(path, fresh) {
+  if (!fresh && rnCache.has(path)) return rnCache.get(path);
+  const j = await api("/api/render/list?path=" + encodeURIComponent(path));
+  if (j.ok) rnCache.set(path, j);
+  return j;
+}
+function rnStart() {
+  if (rnLoaded) return;
+  rnLoaded = true;
+  rnGo("");
+}
+async function rnGo(path, mode) {          // mode: undefined = new navigation, "hist" = back/forward, "fresh" = refresh
+  $("rnList").innerHTML = '<div class="empty">Loading…</div>';
+  const j = await rnList(path, mode === "fresh");
+  if (!j.ok) { $("rnList").innerHTML = `<div class="empty">${esc(j.message)}</div>`; rnEntries = []; $("rnInfo").textContent = ""; $("rnTree").innerHTML = ""; return; }
+  rnCur = j.path;
+  if (!mode) { rnHist = rnHist.slice(0, rnPos + 1); if (rnHist[rnHist.length - 1] !== rnCur) rnHist.push(rnCur); rnPos = rnHist.length - 1; }
+  rnEntries = j.entries;
+  let acc = ""; rnOpen.add("");
+  for (const seg of rnCur.split("/").filter(Boolean)) { acc += (acc ? "/" : "") + seg; rnOpen.add(acc); }
+  renderRn(j);
+}
+function renderRn(j) {
+  $("rnBack").disabled = rnPos <= 0; $("rnFwd").disabled = rnPos >= rnHist.length - 1; $("rnUp").disabled = rnCur === "";
+  $("rnRoot").textContent = j.root || rnFolder;
+  const segs = rnCur.split("/").filter(Boolean); let acc = "";
+  $("rnCrumbs").innerHTML = `<a data-p="">${esc(j.root || rnFolder)}</a>` + segs.map((sg) => { acc += (acc ? "/" : "") + sg; return ` / <a data-p="${esc(acc)}">${esc(sg)}</a>`; }).join("");
+  const k = rnSort.key, dir = rnSort.asc ? 1 : -1;
+  const list = [...rnEntries].sort((x, y) => (x.is_dir === y.is_dir ? 0 : x.is_dir ? -1 : 1) || dir * (k === "name" ? x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: "base" }) : ((x[k] ?? -1) - (y[k] ?? -1))));
+  document.querySelectorAll("#rnHead span[data-sort]").forEach((e) => { e.className = e.dataset.sort === k ? "sorted" + (rnSort.asc ? " asc" : "") : ""; });
+  $("rnList").innerHTML = list.length ? list.map((e) => {
+    const i = rnEntries.indexOf(e);
+    return `<div class="ex-row" data-i="${i}"><div class="ex-name ${e.is_dir ? "dir" : ""}" ${e.is_dir ? `data-go="${i}"` : ""}>${e.is_dir ? "📁" : "🗎"} ${esc(e.name)}</div><div class="when">${e.mtime ? fmtDate(e.mtime) : "–"}</div><div class="num">${e.is_dir ? "" : fmtSize(e.size)}</div><div class="ex-act">${e.is_dir ? "" : `<button class="btn sm primary" data-up="${i}" title="Upload to printer">⬆ Upload</button>`}</div></div>`;
+  }).join("") : '<div class="empty">No subfolders or .goo files here.</div>';
+  const files = rnEntries.filter((e) => !e.is_dir), tot = files.reduce((a, e) => a + (e.size || 0), 0);
+  $("rnInfo").textContent = `${rnEntries.length - files.length} folder(s), ${files.length} .goo file(s), ${fmtSize(tot)} · double-click a file to upload it`;
+  renderRnTree(j.root || rnFolder);
+}
+function renderRnTree(rootName) {
+  const node = (path, name, depth) => {
+    const open = rnOpen.has(path), cached = rnCache.get(path);
+    let h = `<div class="tn ${path === rnCur ? "cur" : ""}" style="padding-left:${4 + depth * 2}px"><span class="tw" data-tt="${esc(path)}">${open ? "▾" : "▸"}</span><span data-tg="${esc(path)}">📁 ${esc(name)}</span></div>`;
+    if (open && cached) h += '<div class="tkids">' + cached.entries.filter((e) => e.is_dir).map((e) => node(e.path, e.name, depth + 1)).join("") + "</div>";
+    return h;
+  };
+  $("rnTree").innerHTML = node("", rootName.split(/[\\/]/).filter(Boolean).pop() || rootName, 0);
+}
+$("rnTree").addEventListener("click", async (e) => {
+  const t = e.target.dataset;
+  if (t.tt != null) {
+    if (rnOpen.has(t.tt) && t.tt !== "") rnOpen.delete(t.tt); else { rnOpen.add(t.tt); await rnList(t.tt); }
+    renderRnTree(rnCache.get("")?.root || rnFolder);
+  } else if (t.tg != null) rnGo(t.tg);
+});
+$("rnCrumbs").addEventListener("click", (e) => { const a = e.target.closest("a"); if (a) rnGo(a.dataset.p); });
+$("rnBack").onclick = () => { if (rnPos > 0) { rnPos--; rnGo(rnHist[rnPos], "hist"); } };
+$("rnFwd").onclick = () => { if (rnPos < rnHist.length - 1) { rnPos++; rnGo(rnHist[rnPos], "hist"); } };
+$("rnUp").onclick = () => rnGo(rnCur.includes("/") ? rnCur.slice(0, rnCur.lastIndexOf("/")) : "");
+$("rnRefresh").onclick = async () => { rnCache.clear(); await rnGo(rnCur, "fresh"); for (const p of rnOpen) if (!rnCache.has(p)) await rnList(p); renderRnTree(rnCache.get("")?.root || rnFolder); };
+$("rnHead").addEventListener("click", (e) => { const k = e.target.dataset.sort; if (!k) return; rnSort = { key: k, asc: rnSort.key === k ? !rnSort.asc : true }; renderRn({ root: rnCache.get("")?.root }); });
+async function rnUpload(en) {
+  if (S && S.upload && ["sending", "verifying"].includes(S.upload.phase)) return toast("An upload is already in progress", "bad");
+  const d = await confirmDialog(`<h3>Upload to printer?</h3><p><b>${esc(en.name)}</b> <span class="muted">(${fmtSize(en.size)})</span></p><p class="muted">${esc(rnJoin(en.path))}</p>`, "Upload");
+  if (!d) return;
+  lastUploadPhase = null;
+  const j = await api("/api/render/upload", { path: en.path });
+  if (!j.ok) toast(j.message || "Upload failed", "bad");
+}
+$("rnList").addEventListener("click", (e) => {
+  const d = e.target.dataset;
+  if (d.go != null) return rnGo(rnEntries[d.go].path);
+  if (d.up != null) rnUpload(rnEntries[d.up]);
+});
+$("rnList").addEventListener("dblclick", (e) => {
+  const row = e.target.closest(".ex-row"); if (!row || e.target.closest("button")) return;
+  const en = rnEntries[row.dataset.i];
+  if (en && !en.is_dir) rnUpload(en);
+});
+
 // ------------------------------------------------------------------ boot
 fetch("/api/config").then((r) => r.json()).then((c) => {
-  cfgLight = !!c.light_enabled; if (S) render();
+  cfgLight = !!c.light_enabled; rnFolder = c.render_folder || ""; if (S) render();
 });
 connectWS();
 fetch("/api/state").then((r) => r.json()).then((s) => { S = s; render(); });

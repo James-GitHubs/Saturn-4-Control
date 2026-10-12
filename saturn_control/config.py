@@ -19,6 +19,7 @@ DEFAULTS = {
     "light_enabled": False,          # show the light button in the header (see the Printer tab's light test)
     "keepalive_seconds": 12,         # how often the app polls the printer to prove the link is alive
     "keepalive_timeout": 8,
+    "render_folder": "E:\\Rendered Prints",   # Render Upload tab: local folder (on the PC running this app) holding rendered .goo files
     "camera_quality": 2,             # ffmpeg JPEG quality for the RTSP camera, 2 (best) .. 31 (worst)
 }
 

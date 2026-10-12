@@ -74,6 +74,7 @@
       <button data-tab="history">History</button>
       <button data-tab="printer">Printer</button>
       <button data-tab="explorer">Explorer</button>
+      <button data-tab="render">Render Upload</button>
     </nav>
 
     <!-- FILES -->
@@ -180,6 +181,33 @@
             <div class="ex-head" id="exHead"><span data-sort="name">Name</span><span data-sort="mtime">Modified</span><span data-sort="size">Size</span><span></span></div>
             <div id="exList" class="ex-list"></div>
             <div id="exInfo" class="muted ex-info"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RENDER UPLOAD (local folder of rendered .goo files on the PC running this app) -->
+    <div class="tab hidden" id="tab-render">
+      <div class="card">
+        <div class="card-h wrap">
+          <h2>Render Upload</h2><span class="muted" id="rnRoot">local folder on this PC</span>
+          <div class="spacer"></div>
+          <button class="btn sm" id="rnBack" title="Back" disabled>◀</button>
+          <button class="btn sm" id="rnFwd" title="Forward" disabled>▶</button>
+          <button class="btn sm" id="rnUp" title="Up one folder">⬆ Up</button>
+          <button class="btn sm" id="rnRefresh">⟳ Refresh</button>
+        </div>
+        <div class="ex-bar"><div id="rnCrumbs" class="crumbs"></div></div>
+        <div id="rnUploadBox" class="upload hidden">
+          <div class="up-row"><b id="rnUpName"></b><span id="rnUpPhase"></span><button class="btn sm danger" id="rnUpCancel">Cancel</button></div>
+          <div class="bar"><div id="rnUpBar" style="width:0%"></div><span id="rnUpPct"></span></div>
+        </div>
+        <div class="ex-wrap">
+          <div class="ex-tree" id="rnTree"></div>
+          <div class="ex-main">
+            <div class="ex-head" id="rnHead"><span data-sort="name">Name</span><span data-sort="mtime">Modified</span><span data-sort="size">Size</span><span></span></div>
+            <div id="rnList" class="ex-list"></div>
+            <div id="rnInfo" class="muted ex-info"></div>
           </div>
         </div>
       </div>
