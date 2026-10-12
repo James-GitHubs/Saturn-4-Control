@@ -9,6 +9,7 @@
   "open_browser": true,
   "auto_exit": true,
   "light_enabled": false,
+  "render_folder": "",
   "keepalive_seconds": 12,
   "keepalive_timeout": 8
 }

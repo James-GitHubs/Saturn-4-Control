@@ -94,28 +94,37 @@ def create_app(cfg=None):
     async def get_config(request):
         return web.json_response({"printer_ip": cfg["printer_ip"], "printer_port": cfg["printer_port"],
                                   "video_port": cfg["video_port"],
-                                  "light_enabled": bool(cfg.get("light_enabled"))})
+                                  "light_enabled": bool(cfg.get("light_enabled")),
+                                  "render_folder": cfg.get("render_folder", "")})
 
     @routes.post("/api/settings")
     async def save_settings(request):
         b = await request.json()
-        ip = (b.get("printer_ip") or "").strip()
+        ip = (b.get("printer_ip") or "").strip() or cfg["printer_ip"]
         import ipaddress
         try:
             ipaddress.ip_address(ip)
         except ValueError:
             return jerr("That is not a valid IP address")
+        render_folder = b.get("render_folder")
+        if render_folder is not None:
+            render_folder = str(render_folder).strip().strip('"')
         path = Path(os.environ.get("SATURN_CONFIG") or ROOT / "config.json")
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
             data["printer_ip"] = ip
+            if render_folder is not None:
+                data["render_folder"] = render_folder
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as e:
             return jerr(f"Could not save {path}: {e}", 500)
         if ip != printer().ip:
             printer().reconfigure(ip)
         cfg["printer_ip"] = ip
-        return web.json_response({"ok": True, "printer_ip": ip, "saved_to": str(path)})
+        if render_folder is not None:
+            cfg["render_folder"] = render_folder
+        return web.json_response({"ok": True, "printer_ip": ip, "render_folder": cfg.get("render_folder", ""),
+                                  "saved_to": str(path)})
 
     # ---------------------------------------------------------------- live updates
     @routes.get("/ws")
@@ -464,6 +473,87 @@ def create_app(cfg=None):
             return web.json_response({"ok": True})
         return jerr("No upload running", 409)
 
+    # ---------------------------------------------------------------- render upload (local .goo folder)
+    def render_root():
+        return Path(cfg.get("render_folder") or "").expanduser()
+
+    def render_resolve(rel):
+        """Map a client-supplied relative path onto the render folder; None if it escapes it."""
+        if not cfg.get("render_folder"):
+            return Path(), None
+        root = render_root().resolve()
+        parts = [x for x in str(rel or "").replace("\\", "/").split("/") if x]
+        if any(x == ".." for x in parts):
+            return root, None
+        target = root.joinpath(*parts).resolve()
+        if target != root and root not in target.parents:
+            return root, None
+        return root, target
+
+    @routes.get("/api/render/list")
+    async def render_list(request):
+        rel = request.query.get("path", "")
+        if not cfg.get("render_folder"):
+            return jerr("No render folder set yet. Use Change folder to choose one.", 400, no_folder=True)
+        root, target = render_resolve(rel)
+        if target is None:
+            return jerr("That path is outside the render folder", 403)
+        if not root.is_dir():
+            return jerr(f"Render folder not found: {root}. Set it in the app settings (gear icon).", 404)
+        if not target.is_dir():
+            return jerr("Folder not found", 404)
+        entries = []
+        try:
+            for e in os.scandir(target):
+                try:
+                    is_dir = e.is_dir()
+                    if not is_dir and not (e.is_file() and e.name.lower().endswith(".goo")):
+                        continue
+                    st = e.stat()
+                except OSError:
+                    continue
+                full = Path(e.path).resolve()
+                if root not in full.parents:     # symlink/junction pointing outside the folder
+                    continue
+                entries.append({"name": e.name, "path": full.relative_to(root).as_posix(), "is_dir": is_dir,
+                                "size": None if is_dir else st.st_size, "mtime": int(st.st_mtime)})
+        except OSError as e:
+            return jerr(f"Could not read the folder: {e}", 500)
+        here = "" if target == root else target.relative_to(root).as_posix()
+        return web.json_response({"ok": True, "root": str(root), "path": here, "entries": entries})
+
+    @routes.post("/api/render/upload")
+    async def render_upload(request):
+        p = printer()
+        b = await request.json()
+        if not cfg.get("render_folder"):
+            return jerr("No render folder set yet. Use Change folder to choose one.", 400, no_folder=True)
+        root, target = render_resolve(b.get("path"))
+        if target is None:
+            return jerr("That path is outside the render folder", 403)
+        if not target.is_file() or target.suffix.lower() != ".goo":
+            return jerr("File not found (only .goo files can be uploaded from here)", 404)
+        if p.upload and p.upload.get("phase") in ("sending", "verifying"):
+            return jerr("An upload is already in progress", 409)
+        if not p.connected:
+            return jerr("Not connected to the printer", 502)
+        size = target.stat().st_size
+        if size == 0:
+            return jerr("That file is empty")
+
+        def hash_file():
+            h = hashlib.md5()
+            with open(target, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        md5 = await asyncio.get_running_loop().run_in_executor(None, hash_file)
+
+        async def job():
+            await p.upload_file(str(target), target.name, size, md5, False)
+        app["upload_task"] = asyncio.create_task(job())
+        return web.json_response({"ok": True, "name": target.name, "size": size, "md5": md5}, status=202)
+
     # ---------------------------------------------------------------- proxying printer-hosted resources
     IMG_EXT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
 
@@ -769,6 +859,11 @@ def create_app(cfg=None):
 
     app.router.add_routes(routes)
     app.router.add_static("/static", STATIC, show_index=False)
+
+    async def no_cache_static(request, response):     # always re-check the page scripts, so updates show on a normal refresh
+        if request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+    app.on_response_prepare.append(no_cache_static)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
