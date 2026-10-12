@@ -138,6 +138,12 @@ async def main(minimal=False):
             open(os.path.join(rdir, "Arthas", "parts", "Arthas Base.goo"), "wb").write(gpay)
             open(os.path.join(rdir, "Arthas", "notes.txt"), "w").write("not a goo")
             open(os.path.join(rdir, "top.goo"), "wb").write(os.urandom(1000))
+            st_, rl = await get("/api/render/list")
+            check("render folder blank by default -> asks to set one", st_ == 400 and rl.get("no_folder"), rl)
+            _, c = await get("/api/config")
+            check("config reports blank render folder by default", c["render_folder"] == "", c)
+            async with s.get(BASE + "/static/app.js") as rr:
+                check("static files are served with Cache-Control: no-cache", rr.headers.get("Cache-Control") == "no-cache", dict(rr.headers))
             r = await post("/api/settings", {"render_folder": rdir})
             check("settings saves render folder", r["ok"] and r["render_folder"] == rdir and json.load(open(cfgfile))["render_folder"] == rdir, r)
             _, c = await get("/api/config")

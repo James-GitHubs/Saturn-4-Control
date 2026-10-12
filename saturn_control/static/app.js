@@ -270,7 +270,7 @@ $("btnRawFiles").onclick = () => {
   navigator.clipboard.writeText(raw).then(() => toast("Raw file list copied (" + fileItems.length + " entries)", "ok"), () => { toast("Copy failed", "bad"); });
 };
 $("btnSettings").onclick = async () => {
-  const d = await confirmDialog(`<h3>App settings</h3><label>Printer IP address<br><input class="input" id="setIp" value="${esc(S ? S.printer_ip : "")}" style="margin-top:6px;width:100%"></label><label style="display:block;margin-top:12px">Render Upload folder (on this PC)<br><input class="input" id="setRender" value="${esc(rnFolder)}" placeholder="E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. The app reconnects straight away.</p>`, "Save");
+  const d = await confirmDialog(`<h3>App settings</h3><label>Printer IP address<br><input class="input" id="setIp" value="${esc(S ? S.printer_ip : "")}" style="margin-top:6px;width:100%"></label><label style="display:block;margin-top:12px">Render upload folder (on this PC)<br><input class="input" id="setRender" value="${esc(rnFolder)}" placeholder="e.g. E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. The app reconnects straight away.</p>`, "Save");
   if (!d) return;
   const j = await act("/api/settings", { printer_ip: $("setIp").value, render_folder: $("setRender").value }, "Saved. Reconnecting…");
   if (j.ok) {
@@ -604,7 +604,11 @@ function rnStart() {
 async function rnGo(path, mode) {          // mode: undefined = new navigation, "hist" = back/forward, "fresh" = refresh
   $("rnList").innerHTML = '<div class="empty">Loading…</div>';
   const j = await rnList(path, mode === "fresh");
-  if (!j.ok) { $("rnList").innerHTML = `<div class="empty">${esc(j.message)}</div>`; rnEntries = []; $("rnInfo").textContent = ""; $("rnTree").innerHTML = ""; return; }
+  if (!j.ok) {
+    $("rnList").innerHTML = `<div class="empty">${esc(j.message)}</div>`; rnEntries = []; $("rnInfo").textContent = ""; $("rnTree").innerHTML = "";
+    $("rnRoot").textContent = j.no_folder ? "no folder set" : rnFolder; $("rnCrumbs").innerHTML = "";
+    return;
+  }
   rnCur = j.path;
   if (!mode) { rnHist = rnHist.slice(0, rnPos + 1); if (rnHist[rnHist.length - 1] !== rnCur) rnHist.push(rnCur); rnPos = rnHist.length - 1; }
   rnEntries = j.entries;
@@ -632,7 +636,8 @@ function renderRnTree(rootName) {
   const node = (path, name, depth) => {
     const open = rnOpen.has(path), cached = rnCache.get(path);
     let h = `<div class="tn ${path === rnCur ? "cur" : ""}" style="padding-left:${4 + depth * 2}px"><span class="tw" data-tt="${esc(path)}">${open ? "▾" : "▸"}</span><span data-tg="${esc(path)}">📁 ${esc(name)}</span></div>`;
-    if (open && cached) h += '<div class="tkids">' + cached.entries.filter((e) => e.is_dir).map((e) => node(e.path, e.name, depth + 1)).join("") + "</div>";
+    if (open && cached) h += '<div class="tkids">' + [...cached.entries].sort((x, y) => (x.is_dir === y.is_dir ? 0 : x.is_dir ? -1 : 1) || x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: "base" }))
+      .map((e) => e.is_dir ? node(e.path, e.name, depth + 1) : `<div class="tn tf" data-tf="${esc(e.path)}" title="Double-click to upload" style="padding-left:${4 + (depth + 1) * 2}px"><span class="tw"></span><span>🗎 ${esc(e.name)}</span></div>`).join("") + "</div>";
     return h;
   };
   $("rnTree").innerHTML = node("", rootName.split(/[\\/]/).filter(Boolean).pop() || rootName, 0);
@@ -644,7 +649,24 @@ $("rnTree").addEventListener("click", async (e) => {
     renderRnTree(rnCache.get("")?.root || rnFolder);
   } else if (t.tg != null) rnGo(t.tg);
 });
+$("rnTree").addEventListener("click", (e) => {      // a .goo file in the tree: open its folder
+  const row = e.target.closest("[data-tf]"); if (!row) return;
+  const p = row.dataset.tf, dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+  if (dir !== rnCur) rnGo(dir);
+});
+$("rnTree").addEventListener("dblclick", (e) => {   // ...and double-click uploads it
+  const row = e.target.closest("[data-tf]"); if (!row) return;
+  const p = row.dataset.tf, dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : "";
+  const en = (rnCache.get(dir)?.entries || []).find((x) => x.path === p);
+  if (en) rnUpload(en);
+});
 $("rnCrumbs").addEventListener("click", (e) => { const a = e.target.closest("a"); if (a) rnGo(a.dataset.p); });
+$("rnFolderBtn").onclick = async () => {
+  const d = await confirmDialog(`<h3>Render upload folder</h3><label>Folder on this PC<br><input class="input" id="setRenderFolder" value="${esc(rnFolder)}" placeholder="e.g. E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. Leave it blank to clear it.</p>`, "Save");
+  if (!d) return;
+  const j = await act("/api/settings", { render_folder: $("setRenderFolder").value }, "Folder saved");
+  if (j.ok) { rnFolder = j.render_folder; rnReset(); rnStart(); }
+};
 $("rnBack").onclick = () => { if (rnPos > 0) { rnPos--; rnGo(rnHist[rnPos], "hist"); } };
 $("rnFwd").onclick = () => { if (rnPos < rnHist.length - 1) { rnPos++; rnGo(rnHist[rnPos], "hist"); } };
 $("rnUp").onclick = () => rnGo(rnCur.includes("/") ? rnCur.slice(0, rnCur.lastIndexOf("/")) : "");

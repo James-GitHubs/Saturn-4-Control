@@ -13,7 +13,7 @@ A local web UI (Fluidd-style) for an Elegoo Saturn 4 Ultra, using Elegoo's SDCP 
 - `web_host` - `127.0.0.1` = this PC only. Use `0.0.0.0` to open it from your phone/other PCs on the LAN (no password, so LAN only).
 - `web_port`, `printer_port` (3030), `video_port` (3031), `udp_port` (3000), `mainboard_id` (auto-detected).
 - `light_enabled` - `false` (default) hides the header light button. The Printer tab always has an experimental light test.
-- `render_folder` (`E:\Rendered Prints`) - folder on the PC running the app that the **Render Upload** tab browses. Also editable from the gear icon (Settings).
+- `render_folder` (blank by default) - folder on the PC running the app that the **Render upload** tab browses, e.g. `"E:\\Rendered Prints"`. Set it here before the first run, or from the gear icon / the tab's **Change folder** button. While it is blank the tab just asks you to set it.
 - `camera_quality` (2) - ffmpeg JPEG quality for the RTSP camera, 2 = best, 31 = worst.
 - `keepalive_seconds` (12) / `keepalive_timeout` (8) - how often the app polls the printer (Cmd 0) to keep the websocket from being dropped; 2 missed polls reconnect.
 
@@ -27,10 +27,10 @@ and a Fluidd-style Console under the page: a live, timestamped log of every comm
 
 Also: an **Explorer** tab (read-only tree view of the printer's own web server on port 3030: back/forward/up/refresh, sortable, local-time dates, KB/MB sizes, view text/images, download through the app), Files tab details filled from the printer's `file_info.txt`, a badge for files uploaded with `%20` in the name, a toggle to show/delete incomplete upload fragments, vat temperature and film use, and camera slot count with a Release button.
 
-Also: a **Render Upload** tab (same look as Explorer, but it browses a folder on the PC running the app: a tree of subfolders with the `.goo` files inside). Click **Upload** to the right of a file name, or double-click the row, confirm the file name in the popup, and it is sent straight to the printer with the same progress/cancel as the Files tab. It can only see inside the configured render folder.
+Also: a **Render upload** tab (same look as Explorer, but it browses a folder on the PC running the app: a tree of subfolders and the `.goo` files inside them). Click **Upload** to the right of a file name, or double-click the row, confirm the file name in the popup, and it is sent straight to the printer with the same progress/cancel as the Files tab. It can only see inside the configured render folder.
 
 ## Changing the printer IP / render folder
-Click the gear icon (top right), enter the new IP and/or the Render Upload folder, Save. Both are written to `config.json` and take effect immediately.
+Click the gear icon (top right), enter the new IP and/or the Render upload folder, Save. Both are written to `config.json` and take effect immediately.
 
 ## Things that depend on your printer's firmware
 - **File layer height / layers / time / thumbnail**: the public SDCP spec only returns name, size and type in the

@@ -17,7 +17,7 @@
   <div class="hdr-actions">
     <button id="btnLight" class="btn" title="Toggle light">💡 Light</button>
     <button id="btnRefreshAll" class="btn icon" title="Refresh status">⟳</button>
-    <button id="btnSettings" class="btn icon" title="App settings (printer IP)">⚙</button>
+    <button id="btnSettings" class="btn icon" title="App settings">⚙</button>
   </div>
 </header>
 
@@ -74,7 +74,7 @@
       <button data-tab="history">History</button>
       <button data-tab="printer">Printer</button>
       <button data-tab="explorer">Explorer</button>
-      <button data-tab="render">Render Upload</button>
+      <button data-tab="render">Render upload</button>
     </nav>
 
     <!-- FILES -->
@@ -190,8 +190,9 @@
     <div class="tab hidden" id="tab-render">
       <div class="card">
         <div class="card-h wrap">
-          <h2>Render Upload</h2><span class="muted" id="rnRoot">local folder on this PC</span>
+          <h2>Render upload</h2><span class="muted" id="rnRoot">local folder on this PC</span>
           <div class="spacer"></div>
+          <button class="btn sm" id="rnFolderBtn" title="Change the folder this tab browses">📁 Change folder</button>
           <button class="btn sm" id="rnBack" title="Back" disabled>◀</button>
           <button class="btn sm" id="rnFwd" title="Forward" disabled>▶</button>
           <button class="btn sm" id="rnUp" title="Up one folder">⬆ Up</button>

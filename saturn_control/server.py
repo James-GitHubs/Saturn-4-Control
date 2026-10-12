@@ -109,8 +109,6 @@ def create_app(cfg=None):
         render_folder = b.get("render_folder")
         if render_folder is not None:
             render_folder = str(render_folder).strip().strip('"')
-            if not render_folder:
-                return jerr("The render folder cannot be empty")
         path = Path(os.environ.get("SATURN_CONFIG") or ROOT / "config.json")
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
@@ -481,6 +479,8 @@ def create_app(cfg=None):
 
     def render_resolve(rel):
         """Map a client-supplied relative path onto the render folder; None if it escapes it."""
+        if not cfg.get("render_folder"):
+            return Path(), None
         root = render_root().resolve()
         parts = [x for x in str(rel or "").replace("\\", "/").split("/") if x]
         if any(x == ".." for x in parts):
@@ -493,6 +493,8 @@ def create_app(cfg=None):
     @routes.get("/api/render/list")
     async def render_list(request):
         rel = request.query.get("path", "")
+        if not cfg.get("render_folder"):
+            return jerr("No render folder set yet. Use Change folder to choose one.", 400, no_folder=True)
         root, target = render_resolve(rel)
         if target is None:
             return jerr("That path is outside the render folder", 403)
@@ -524,6 +526,8 @@ def create_app(cfg=None):
     async def render_upload(request):
         p = printer()
         b = await request.json()
+        if not cfg.get("render_folder"):
+            return jerr("No render folder set yet. Use Change folder to choose one.", 400, no_folder=True)
         root, target = render_resolve(b.get("path"))
         if target is None:
             return jerr("That path is outside the render folder", 403)
@@ -855,6 +859,11 @@ def create_app(cfg=None):
 
     app.router.add_routes(routes)
     app.router.add_static("/static", STATIC, show_index=False)
+
+    async def no_cache_static(request, response):     # always re-check the page scripts, so updates show on a normal refresh
+        if request.path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache"
+    app.on_response_prepare.append(no_cache_static)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)
     return app
