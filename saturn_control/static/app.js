@@ -69,13 +69,34 @@ function connectWS() {
   ws.onclose = () => { setTimeout(connectWS, 2000); S && ((S.connected = false), render(true)); };
 }
 let lastUploadPhase = null;
+let cfgPrinters = [], cfgActive = "";
+async function loadPrinters() { const c = await api("/api/config"); if (c.printers) { cfgPrinters = c.printers; cfgActive = c.active_printer; } }
+const activePrinter = () => cfgPrinters.find((p) => p.id === cfgActive);
+function renderPrinterMenu() {
+  $("printerMenu").innerHTML = (cfgPrinters.length ? "" : '<div class="pi" style="cursor:default;color:var(--muted)">No printers saved</div>') + cfgPrinters.map((p) => `<div class="pi ${p.id === cfgActive ? "cur" : ""}" data-id="${esc(p.id)}"><span class="tick">${p.id === cfgActive ? "✓" : ""}</span><span class="pname">${esc(p.name)}</span><span class="ip">${esc(p.ip)}:${esc(p.printer_port)}</span></div>`).join("") + '<div class="sep"></div><div class="pi manage" data-manage="1">Add or remove printers…</div>';
+}
+$("connBtn").onclick = async (e) => {
+  e.stopPropagation();
+  const m = $("printerMenu");
+  if (!m.classList.contains("hidden")) { m.classList.add("hidden"); $("connBtn").classList.remove("open"); return; }
+  await loadPrinters(); renderPrinterMenu(); m.classList.remove("hidden"); $("connBtn").classList.add("open");
+};
+document.addEventListener("click", () => { $("printerMenu").classList.add("hidden"); $("connBtn").classList.remove("open"); });
+$("printerMenu").addEventListener("click", async (e) => {
+  const row = e.target.closest(".pi"); if (!row) return;
+  if (row.dataset.manage) return openSettings();
+  const id = row.dataset.id; if (!id || id === cfgActive) return;
+  const j = await act("/api/printers/select", { id }, "Switching printer…");
+  if (j.ok) setTimeout(() => location.reload(), 600);
+});
 function render(serverDown) {
   if (!S) return;
   const conn = S.connected && !serverDown;
   $("connDot").classList.toggle("off", !conn);
-  $("connText").textContent = serverDown ? "App server unreachable" : conn ? `Connected · ${S.printer_ip}` : `Printer offline (${S.printer_ip}) – retrying…`;
+  $("connText").textContent = serverDown ? "App server unreachable" : !S.printer_ip ? "No printer – add one" : conn ? `Connected · ${S.printer_ip}` : `Printer offline (${S.printer_ip}) – retrying…`;
   const a = S.attributes || {};
-  $("printerName").textContent = a.Name || "Saturn Control";
+  const custom = S.printer_name || (activePrinter() || {}).name;
+  $("printerName").textContent = a.Name ? (custom && custom !== a.Name ? `${a.Name} - ${custom}` : a.Name) : (custom || "Saturn Control");
   document.title = (a.Name || "Saturn Control") + (S.machine_status_codes.includes(1) ? ` · ${Math.round(S.progress)}%` : "");
   const busy = S.machine_status_codes;
   const chip = $("stateChip");
@@ -167,24 +188,66 @@ function renderMessages() {
   const items = [...(S.errors || []).map((e) => ["Error", e]), ...(S.notices || []).map((e) => ["Notice", e])].sort((x, y) => y[1].t - x[1].t);
   $("msgList").innerHTML = items.length ? items.map(([k, e]) => `<div><b>${k}</b> <span class="muted">${new Date(e.t * 1000).toLocaleTimeString()}</span> ${esc(JSON.stringify(e.data))}</div>`).join("") : '<div class="muted">No messages</div>';
 }
+const fmtSpeed = (b) => (b == null || !isFinite(b) ? "–" : fmtSize(b) + "/s");
+const uploadBusy = () => !!(S && ((S.upload && ["sending", "verifying"].includes(S.upload.phase)) || (S.queue || []).length));
 function renderUpload(u) {
+  const q = (S && S.queue) || [], sp = (S && S.space) || {};
+  const running = !!(u && ["sending", "verifying"].includes(u.phase));
   for (const [boxId, pre] of [["uploadBox", "up"], ["rnUploadBox", "rnUp"]]) {
     const box = $(boxId);
-    if (!u || u.phase === "done" && Date.now() / 1000 - (u.finished || 0) > 6 || (u.phase === "cancelled")) { box.classList.add("hidden"); }
+    if (!q.length && (!u || u.phase === "done" && Date.now() / 1000 - (u.finished || 0) > 6 || (u.phase === "cancelled"))) { box.classList.add("hidden"); }
     else {
       box.classList.remove("hidden");
-      $(pre + "Name").textContent = u.name;
-      const pct = u.total ? (u.sent / u.total) * 100 : 0;
-      $(pre + "Bar").style.width = pct + "%"; $(pre + "Pct").textContent = Math.round(pct) + "%";
-      $(pre + "Phase").textContent = { sending: "Sending to printer…", verifying: "Printer verifying…", done: "Uploaded ✓", error: "Failed" }[u.phase] + (u.error ? " – " + u.error : "");
-      $(pre + "Cancel").classList.toggle("hidden", !["sending", "verifying"].includes(u.phase));
+      if (u) {
+        $(pre + "Name").textContent = u.name;
+        const pct = u.total ? (u.sent / u.total) * 100 : 0;
+        $(pre + "Bar").style.width = pct + "%"; $(pre + "Pct").textContent = Math.round(pct) + "%";
+        $(pre + "Phase").textContent = { sending: "Sending to printer…", verifying: "Printer verifying…", done: "Uploaded ✓", error: "Failed", cancelled: "Cancelled" }[u.phase] + (u.error ? " – " + u.error : "");
+        const eta = u.phase === "sending" && u.speed_avg ? (u.total - u.sent) / u.speed_avg : null;
+        $(pre + "Speed").innerHTML = u.speed_avg != null ? `Average <b>${fmtSpeed(u.speed_avg)}</b> · Now <b>${u.phase === "sending" ? fmtSpeed(u.speed_now) : "–"}</b>${eta != null ? ` · ${fmtDur(eta)} left` : ""}` : "";
+      } else { $(pre + "Name").textContent = "Next upload starting…"; $(pre + "Phase").textContent = ""; $(pre + "Speed").textContent = ""; $(pre + "Bar").style.width = "0%"; $(pre + "Pct").textContent = ""; }
+      $(pre + "Cancel").classList.toggle("hidden", !running);
+      const qb = $(pre + "Queue");
+      qb.classList.toggle("hidden", !q.length);
+      qb.innerHTML = q.length ? `<div class="q-head"><b>Up next (${q.length})</b><button class="btn sm" data-qclear="1">Clear queue</button></div>`
+        + q.map((x, i) => `<div class="q-row"><span class="q-n">${i + 1}. ${esc(x.name)} <span class="muted">(${fmtSize(x.size)})</span></span><button class="btn sm" data-qid="${x.id}" title="Remove from the queue">✕</button></div>`).join("")
+        + (sp.after != null ? `<div class="q-space">Free space once all of these are uploaded: <span class="${sp.after < 0 ? "neg" : ""}">${sp.after < 0 ? "-" : ""}${fmtSize(Math.abs(sp.after))}</span> (now ${fmtSize(sp.free)})</div>` : "") : "";
     }
   }
-  if (u && u.phase !== lastUploadPhase) {
-    if (u.phase === "done") { toast(`Uploaded ${u.name}`, "ok"); loadFiles(); }
+  document.querySelectorAll("[data-up]").forEach((b) => { b.textContent = uploadBusy() ? "＋ Queue" : "⬆ Upload"; });
+  $("btnUpload").textContent = uploadBusy() ? "＋ Queue" : "⬆ Upload";
+  const key = u ? u.id + ":" + u.phase : null;
+  if (u && key !== lastUploadPhase) {
+    if (u.phase === "done") { toast(`Uploaded ${u.name}`, "ok"); loadFiles(); rnRecheck(); }
     if (u.phase === "error") toast("Upload failed: " + u.error, "bad");
-    lastUploadPhase = u.phase;
+    lastUploadPhase = key;
   }
+}
+function rnRecheck() {            // the printer takes a moment to list a file it just verified, so look again a bit later too
+  if (!rnLoaded) return;
+  rnCheckPrinter();
+  setTimeout(() => rnLoaded && rnCheckPrinter(), 2500);
+  setTimeout(() => rnLoaded && rnCheckPrinter(), 8000);
+}
+for (const id of ["uploadBox", "rnUploadBox"]) $(id).addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  if (b.dataset.qid) api("/api/upload/queue/remove", { id: b.dataset.qid });
+  else if (b.dataset.qclear) api("/api/upload/queue/remove", {});
+});
+
+// Free-space line for the upload dialogs: returns { html, over }
+async function spaceBlock(sizes) {
+  const c = await api("/api/upload/check", { sizes });
+  if (!c.ok || !c.known) return { html: '<p class="muted">Free space on the printer could not be read, so it was not checked.</p>', over: false };
+  const waiting = c.free - c.after_now, neg = c.after < 0;
+  const html = `<p class="spaceinfo">Free on printer: <b>${fmtSize(c.free)}</b>${waiting > 0 ? `<br>Already uploading / waiting: <b>${fmtSize(waiting)}</b>` : ""}<br>These files: <b>${fmtSize(c.add)}</b><br>Free after uploading: <b class="${neg ? "neg" : ""}">${neg ? "-" : ""}${fmtSize(Math.abs(c.after))}</b></p>`
+    + (neg ? `<div class="spacewarn">⚠ Not enough free space: short by ${fmtSize(-c.after)}. The printer's free-space figure can be wrong, so you can still force the upload.</div>` : "");
+  return { html, over: neg };
+}
+async function confirmUpload(title, listHtml, sizes, extra = "") {   // resolves to the dialog (confirmed) or null
+  const sb = await spaceBlock(sizes), busy = uploadBusy();
+  return confirmDialog(`<h3>${busy ? "Add to the upload queue" : title}</h3>${listHtml}${sb.html}${extra}`,
+    sb.over ? (busy ? "Force add to queue" : "Force upload") : busy ? "Add to queue" : "Upload", sb.over);
 }
 
 // ------------------------------------------------------------------ tabs
@@ -269,15 +332,34 @@ $("btnRawFiles").onclick = () => {
   const raw = JSON.stringify(fileItems.map((f) => f.raw), null, 1);
   navigator.clipboard.writeText(raw).then(() => toast("Raw file list copied (" + fileItems.length + " entries)", "ok"), () => { toast("Copy failed", "bad"); });
 };
-$("btnSettings").onclick = async () => {
-  const d = await confirmDialog(`<h3>App settings</h3><label>Printer IP address<br><input class="input" id="setIp" value="${esc(S ? S.printer_ip : "")}" style="margin-top:6px;width:100%"></label><label style="display:block;margin-top:12px">Render upload folder (on this PC)<br><input class="input" id="setRender" value="${esc(rnFolder)}" placeholder="e.g. E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. The app reconnects straight away.</p>`, "Save");
+$("btnSettings").onclick = () => openSettings();
+async function openSettings() {
+  await loadPrinters();
+  let list = cfgPrinters.map((p) => ({ ...p }));      // keeps each printer's extra ports (video/udp/web) untouched
+  const draw = () => { $("setList").innerHTML = !list.length ? '<div class="muted" style="padding:8px 0">No printers. Add one below.</div>' : list.map((p, i) => `<div class="prow"><input class="input pn" data-f="name" data-i="${i}" value="${esc(p.name)}" placeholder="Name"><input class="input pip" data-f="ip" data-i="${i}" value="${esc(p.ip)}" placeholder="IP address"><input class="input pport" data-f="printer_port" data-i="${i}" value="${esc(p.printer_port)}" placeholder="Port" inputmode="numeric"><button type="button" class="btn sm danger" data-del="${i}" title="Remove">Delete</button></div>`).join(""); };
+  const pending = confirmDialog(`<h3>App settings</h3><b>Printers</b> <span class="muted">name, IP address, port</span><div id="setList"></div><div class="padd"><input class="input pn" id="newName" placeholder="Name (optional: the printer's own name is used)"><input class="input pip" id="newIp" placeholder="IP address"><input class="input pport" id="newPort" value="3030" inputmode="numeric" title="Printer port (Saturn 4 Ultra: 3030)"><button type="button" class="btn" id="newAdd">Add</button></div><label style="display:block;margin-top:14px">Render upload folder (on this PC)<br><input class="input" id="setRender" value="${esc(rnFolder)}" placeholder="e.g. E:\\Rendered Prints" style="margin-top:6px;width:100%"></label><p class="muted">Saved to config.json. Pick the printer to use from the status text at the top left. The video, UDP and web ports of each printer can be edited in config.json.</p>`, "Save");
+  draw();
+  const addNew = () => {
+    const name = $("newName").value.trim(), ip = $("newIp").value.trim(), port = $("newPort").value.trim() || "3030";
+    if (!name && !ip) return true;
+    if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) { toast("Enter a valid IP address, e.g. 192.168.0.190", "bad"); return false; }
+    if (!/^\d{1,5}$/.test(port) || +port < 1 || +port > 65535) { toast("Enter a valid port, e.g. 3030", "bad"); return false; }
+    list.push({ name, ip, printer_port: +port, video_port: 3031, udp_port: 3000, web_port: 8080 });   // a blank name is filled in from the printer
+    $("newName").value = ""; $("newIp").value = ""; $("newPort").value = "3030"; draw(); return true;
+  };
+  $("newAdd").onclick = addNew;
+  $("setList").onclick = (e) => { const i = e.target.dataset.del; if (i != null) { list.splice(+i, 1); draw(); } };
+  $("setList").oninput = (e) => { const t = e.target.dataset; if (t.f) list[+t.i][t.f] = e.target.value; };
+  const d = await pending;
   if (!d) return;
-  const j = await act("/api/settings", { printer_ip: $("setIp").value, render_folder: $("setRender").value }, "Saved. Reconnecting…");
-  if (j.ok) {
-    if (j.render_folder !== rnFolder) { rnFolder = j.render_folder; rnReset(); if (!$("tab-render").classList.contains("hidden")) rnStart(); }
-    setTimeout(loadFiles, 2500);
-  }
-};
+  if (($("newName").value.trim() || $("newIp").value.trim()) && !addNew()) return;
+  const ps = await api("/api/printers", { printers: list.map((p) => ({ ...p, printer_port: p.printer_port === "" ? 3030 : +p.printer_port })) });
+  if (!ps.ok) return toast(ps.message || "Could not save the printers", "bad");
+  const j = await act("/api/settings", { render_folder: $("setRender").value }, ps.switched ? "Saved. Switching printer…" : "Saved");
+  if (j.ok && j.render_folder !== rnFolder) { rnFolder = j.render_folder; rnReset(); if (!$("tab-render").classList.contains("hidden")) rnStart(); }
+  cfgPrinters = ps.printers; cfgActive = ps.active_printer; render();
+  if (ps.switched) setTimeout(() => location.reload(), 600);
+}
 $("btnDeleteSel").onclick = () => deleteItems([...selected].map((i) => fileItems[i]));
 async function deleteItems(items) {
   if (!items.length) return;
@@ -305,11 +387,12 @@ const dz = $("dropzone");
 document.addEventListener("drop", (e) => { if (e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]); });
 async function uploadFiles(files) {
   if (!files.length) return;
-  const d = await confirmDialog(`<h3>Upload to printer</h3><ul>${files.map((f) => `<li>${esc(f.name)} <span class="muted">(${fmtSize(f.size)})</span></li>`).join("")}</ul>${files.length === 1 ? '<label><input type="checkbox" id="printAfter"> Start printing as soon as the upload finishes</label>' : ""}`, "Upload");
+  const d = await confirmUpload("Upload to printer", `<ul>${files.map((f) => `<li>${esc(f.name)} <span class="muted">(${fmtSize(f.size)})</span></li>`).join("")}</ul>`, files.map((f) => f.size),
+    files.length === 1 ? '<label><input type="checkbox" id="printAfter"> Start printing as soon as the upload finishes</label>' : "");
   if (!d) return;
   const printAfter = files.length === 1 && $("printAfter").checked;
   for (const f of files) {
-    const ok = await sendOne(f, printAfter);
+    const ok = await sendOne(f, printAfter);          // hands the file to this app; the app queues it for the printer
     if (!ok) break;
   }
 }
@@ -317,19 +400,16 @@ function sendOne(file, printAfter) {
   return new Promise((resolve) => {
     const fd = new FormData(); fd.append("print_after", printAfter ? "1" : "0"); fd.append("file", file, file.name);
     const x = new XMLHttpRequest(); x.open("POST", "/api/upload");
-    const box = $("uploadBox"); box.classList.remove("hidden");
-    $("upName").textContent = file.name; $("upCancel").classList.add("hidden");
-    x.upload.onprogress = (e) => { if (e.lengthComputable) { const p = e.loaded / e.total * 100; $("upBar").style.width = p + "%"; $("upPct").textContent = Math.round(p) + "%"; $("upPhase").textContent = "Sending to this app…"; } };
-    x.onload = async () => {
+    const box = $("uploadBox"); const had = !box.classList.contains("hidden");
+    if (!had) { box.classList.remove("hidden"); $("upName").textContent = file.name; $("upCancel").classList.add("hidden"); }
+    x.upload.onprogress = (e) => { if (e.lengthComputable && !uploadBusy()) { const p = e.loaded / e.total * 100; $("upBar").style.width = p + "%"; $("upPct").textContent = Math.round(p) + "%"; $("upPhase").textContent = "Sending to this app…"; } };
+    x.onload = () => {
       let j = {}; try { j = JSON.parse(x.responseText); } catch { }
-      if (!j.ok) { toast(j.message || "Upload failed", "bad"); box.classList.add("hidden"); return resolve(false); }
-      lastUploadPhase = null;
-      const wait = setInterval(() => {            // wait for printer-side transfer to finish
-        const u = S && S.upload;
-        if (u && u.name === file.name && ["done", "error", "cancelled"].includes(u.phase)) { clearInterval(wait); resolve(u.phase === "done"); }
-      }, 400);
+      if (!j.ok) { toast(j.message || "Upload failed", "bad"); if (!uploadBusy()) box.classList.add("hidden"); return resolve(false); }
+      toast(uploadBusy() ? `Queued ${file.name}` : `Sending ${file.name}`, "ok");
+      resolve(true);
     };
-    x.onerror = () => { toast("Upload failed (connection)", "bad"); box.classList.add("hidden"); resolve(false); };
+    x.onerror = () => { toast("Upload failed (connection)", "bad"); if (!uploadBusy()) box.classList.add("hidden"); resolve(false); };
     x.send(fd);
   });
 }
@@ -422,7 +502,17 @@ $("camRelease").onclick = async () => { camStop(); await act("/api/camera/releas
 $("btnDiscover").onclick = async () => {
   $("discoverOut").textContent = "Scanning…";
   const j = await api("/api/discover", {});
-  $("discoverOut").textContent = j.printers && j.printers.length ? j.printers.map((p) => `${p.Name || p.MachineName} @ ${p.MainboardIP} (${p.FirmwareVersion || "?"})`).join("; ") : "No printers answered";
+  const out = $("discoverOut"); out.textContent = "";
+  if (!j.printers || !j.printers.length) { out.textContent = "No printers answered"; return; }
+  let anyPorts = false;
+  for (const p of j.printers) {
+    const ports = Object.entries(p).filter(([k, v]) => /port/i.test(k) && v != null && v !== "").map(([k, v]) => `${k}: ${v}`);
+    if (ports.length) anyPorts = true;
+    const row = document.createElement("div");
+    row.textContent = `${p.Name || p.MachineName} @ ${p.MainboardIP} (${p.FirmwareVersion || "?"})` + (ports.length ? " · " + ports.join(", ") : "");
+    out.append(row);
+  }
+  if (!anyPorts) { const n = document.createElement("div"); n.textContent = "The scan reply doesn't include ports. Printers normally use 3030 (video 3031)."; n.style.marginTop = "4px"; out.append(n); }
 };
 
 // ------------------------------------------------------------------ console
@@ -586,9 +676,19 @@ function ensureViewer() {
 }
 
 // ------------------------------------------------------------------ render upload (local folder of .goo files)
-let rnFolder = "", rnLoaded = false, rnCur = "", rnHist = [], rnPos = -1, rnEntries = [], rnSort = { key: "name", asc: true };
+let rnPrinter = undefined, rnFolder = "", rnLoaded = false, rnCur = "", rnHist = [], rnPos = -1, rnEntries = [], rnSort = { key: "name", asc: true };
 const rnCache = new Map(), rnOpen = new Set([""]);
 const rnJoin = (rel) => rnFolder.replace(/[\\/]+$/, "") + (rel ? "\\" + rel.replace(/\//g, "\\") : "");
+async function rnCheckPrinter() {        // which of these files are already on the printer (same name and size)?
+  rnPrinter = null; if (rnLoaded) renderRn({ root: rnCache.get("")?.root });
+  const j = await api("/api/render/printer-files");
+  rnPrinter = j.ok ? { ok: true, set: new Set(j.files.map((f) => f.name + "|" + f.size)) } : { ok: false, message: j.message };
+  if (rnLoaded) renderRn({ root: rnCache.get("")?.root });
+}
+const rnUp = (e) => {                        // 1 = uploaded, 0 = not, null = unknown
+  if (e.is_dir || !rnPrinter || !rnPrinter.ok) return null;
+  return rnPrinter.set.has(e.name + "|" + e.size) ? 1 : 0;
+};
 function rnReset() { rnLoaded = false; rnCur = ""; rnHist = []; rnPos = -1; rnEntries = []; rnCache.clear(); rnOpen.clear(); rnOpen.add(""); }
 async function rnList(path, fresh) {
   if (!fresh && rnCache.has(path)) return rnCache.get(path);
@@ -600,6 +700,7 @@ function rnStart() {
   if (rnLoaded) return;
   rnLoaded = true;
   rnGo("");
+  rnCheckPrinter();
 }
 async function rnGo(path, mode) {          // mode: undefined = new navigation, "hist" = back/forward, "fresh" = refresh
   $("rnList").innerHTML = '<div class="empty">Loading…</div>';
@@ -622,11 +723,14 @@ function renderRn(j) {
   const segs = rnCur.split("/").filter(Boolean); let acc = "";
   $("rnCrumbs").innerHTML = `<a data-p="">${esc(j.root || rnFolder)}</a>` + segs.map((sg) => { acc += (acc ? "/" : "") + sg; return ` / <a data-p="${esc(acc)}">${esc(sg)}</a>`; }).join("");
   const k = rnSort.key, dir = rnSort.asc ? 1 : -1;
-  const list = [...rnEntries].sort((x, y) => (x.is_dir === y.is_dir ? 0 : x.is_dir ? -1 : 1) || dir * (k === "name" ? x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: "base" }) : ((x[k] ?? -1) - (y[k] ?? -1))));
+  const list = [...rnEntries].sort((x, y) => (x.is_dir === y.is_dir ? 0 : x.is_dir ? -1 : 1) || dir * (k === "name" ? x.name.localeCompare(y.name, undefined, { numeric: true, sensitivity: "base" }) : ((k === "up" ? (rnUp(x) ?? -1) - (rnUp(y) ?? -1) : (x[k] ?? -1) - (y[k] ?? -1)))));
   document.querySelectorAll("#rnHead span[data-sort]").forEach((e) => { e.className = e.dataset.sort === k ? "sorted" + (rnSort.asc ? " asc" : "") : ""; });
   $("rnList").innerHTML = list.length ? list.map((e) => {
     const i = rnEntries.indexOf(e);
-    return `<div class="ex-row" data-i="${i}"><div class="ex-name ${e.is_dir ? "dir" : ""}" ${e.is_dir ? `data-go="${i}"` : ""}>${e.is_dir ? "📁" : "🗎"} ${esc(e.name)}</div><div class="when">${e.mtime ? fmtDate(e.mtime) : "–"}</div><div class="num">${e.is_dir ? "" : fmtSize(e.size)}</div><div class="ex-act">${e.is_dir ? "" : `<button class="btn sm primary" data-up="${i}" title="Upload to printer">⬆ Upload</button>`}</div></div>`;
+    const up = rnUp(e);
+    const upCell = e.is_dir ? "" : up === 1 ? '<span class="rn-up yes" title="A file with this name and size is on the printer">Yes</span>' : up === 0 ? '<span class="rn-up no" title="Not on the printer, or a different size">No</span>'
+      : `<span class="rn-up na" title="${esc(rnPrinter === null ? "Checking the printer…" : rnPrinter && rnPrinter.message || "Not checked yet")}">${rnPrinter === null ? "…" : "–"}</span>`;
+    return `<div class="ex-row rn" data-i="${i}"><div class="ex-name ${e.is_dir ? "dir" : ""}" ${e.is_dir ? `data-go="${i}"` : ""}>${e.is_dir ? "📁" : "🗎"} ${esc(e.name)}</div><div>${upCell}</div><div class="when">${e.mtime ? fmtDate(e.mtime) : "–"}</div><div class="num">${e.is_dir ? "" : fmtSize(e.size)}</div><div class="ex-act">${e.is_dir ? "" : `<button class="btn sm primary" data-up="${i}" title="Upload to printer">${uploadBusy() ? "＋ Queue" : "⬆ Upload"}</button>`}</div></div>`;
   }).join("") : '<div class="empty">No subfolders or .goo files here.</div>';
   const files = rnEntries.filter((e) => !e.is_dir), tot = files.reduce((a, e) => a + (e.size || 0), 0);
   $("rnInfo").textContent = `${rnEntries.length - files.length} folder(s), ${files.length} .goo file(s), ${fmtSize(tot)} · double-click a file to upload it`;
@@ -670,15 +774,13 @@ $("rnFolderBtn").onclick = async () => {
 $("rnBack").onclick = () => { if (rnPos > 0) { rnPos--; rnGo(rnHist[rnPos], "hist"); } };
 $("rnFwd").onclick = () => { if (rnPos < rnHist.length - 1) { rnPos++; rnGo(rnHist[rnPos], "hist"); } };
 $("rnUp").onclick = () => rnGo(rnCur.includes("/") ? rnCur.slice(0, rnCur.lastIndexOf("/")) : "");
-$("rnRefresh").onclick = async () => { rnCache.clear(); await rnGo(rnCur, "fresh"); for (const p of rnOpen) if (!rnCache.has(p)) await rnList(p); renderRnTree(rnCache.get("")?.root || rnFolder); };
+$("rnRefresh").onclick = async () => { rnCheckPrinter(); rnCache.clear(); await rnGo(rnCur, "fresh"); for (const p of rnOpen) if (!rnCache.has(p)) await rnList(p); renderRnTree(rnCache.get("")?.root || rnFolder); };
 $("rnHead").addEventListener("click", (e) => { const k = e.target.dataset.sort; if (!k) return; rnSort = { key: k, asc: rnSort.key === k ? !rnSort.asc : true }; renderRn({ root: rnCache.get("")?.root }); });
 async function rnUpload(en) {
-  if (S && S.upload && ["sending", "verifying"].includes(S.upload.phase)) return toast("An upload is already in progress", "bad");
-  const d = await confirmDialog(`<h3>Upload to printer?</h3><p><b>${esc(en.name)}</b> <span class="muted">(${fmtSize(en.size)})</span></p><p class="muted">${esc(rnJoin(en.path))}</p>`, "Upload");
+  const d = await confirmUpload("Upload to printer?", `<p><b>${esc(en.name)}</b> <span class="muted">(${fmtSize(en.size)})</span></p><p class="muted">${esc(rnJoin(en.path))}</p>`, [en.size]);
   if (!d) return;
-  lastUploadPhase = null;
   const j = await api("/api/render/upload", { path: en.path });
-  if (!j.ok) toast(j.message || "Upload failed", "bad");
+  if (!j.ok) toast(j.message || "Upload failed", "bad"); else if (uploadBusy()) toast(`Queued ${en.name}`, "ok");
 }
 $("rnList").addEventListener("click", (e) => {
   const d = e.target.dataset;
@@ -693,6 +795,7 @@ $("rnList").addEventListener("dblclick", (e) => {
 
 // ------------------------------------------------------------------ boot
 fetch("/api/config").then((r) => r.json()).then((c) => {
+  if (c.printers) { cfgPrinters = c.printers; cfgActive = c.active_printer; }
   cfgLight = !!c.light_enabled; rnFolder = c.render_folder || ""; if (S) render();
 });
 connectWS();

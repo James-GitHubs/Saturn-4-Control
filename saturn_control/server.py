@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -14,7 +16,7 @@ from urllib.parse import quote, unquote, urlparse
 import aiohttp
 from aiohttp import web
 
-from .config import ROOT, load_config
+from .config import PRINTER_PORTS, ROOT, load_config, normalize_printers
 from .httpfs import has_percent_codes, is_virtual, looks_like_fragment, normalize_dir, parse_listing
 from .printer import CMD, PrinterClient, PrinterError, _num, discover, pick
 
@@ -60,6 +62,41 @@ def jerr(msg, status=400, **extra):
     return web.json_response({"ok": False, "message": msg, **extra}, status=status)
 
 
+CLEANED = threading.Event()       # set once the app has released the camera and closed the printer link
+LOOP = {}                         # the running event loop, for the console-close handler
+
+
+def _graceful_exit():
+    raise web.GracefulExit()
+
+
+def install_console_close_handler():
+    """Windows: closing the cmd window (X), logging off or shutting down kills Python without running its
+    cleanup, which leaves the printer's camera slot (and ffmpeg) open. Catch those events, run the normal
+    shutdown (stops ffmpeg, frees the camera slot) and give it up to 4 s, as Windows allows about 5 s."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        proto = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+
+        def handler(ctrl_type):
+            if ctrl_type not in (2, 5, 6):          # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+                return 0                            # Ctrl+C / Ctrl+Break keep their normal handling
+            loop = LOOP.get("loop")
+            if loop is not None and not loop.is_closed():
+                loop.call_soon_threadsafe(_graceful_exit)
+                CLEANED.wait(4)
+            return 1
+        _CLOSE_HANDLER.append(proto(handler))       # keep a reference so it is not garbage collected
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_CLOSE_HANDLER[-1], 1)
+    except Exception as e:  # noqa: BLE001 - never stop the app from starting over this
+        print(f"Could not install the window-close handler: {e}")
+
+
+_CLOSE_HANDLER = []
+
+
 def create_app(cfg=None):
     cfg = cfg or load_config()
     app = web.Application(client_max_size=1024 ** 2)
@@ -84,15 +121,198 @@ def create_app(cfg=None):
     # ---------------------------------------------------------------- pages
     @routes.get("/")
     async def index(request):
-        return web.FileResponse(STATIC / "index.html", headers={"Cache-Control": "no-cache"})
+        html = (STATIC / "index.html").read_text(encoding="utf-8")
+        for name in ("style.css", "app.js"):          # version the links by file time so an update is never hidden by a cached copy
+            try:
+                v = int((STATIC / name).stat().st_mtime)
+            except OSError:
+                continue
+            html = html.replace(f"/static/{name}", f"/static/{name}?v={v}")
+        return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
+
+    def state_payload():
+        st = printer().public_state()
+        a = next((x for x in cfg.get("printers") or [] if x["id"] == cfg.get("active_printer")), None)
+        st["printer_name"] = a["name"] if a else ""
+        return st
 
     @routes.get("/api/state")
     async def state(request):
-        return web.json_response(printer().public_state())
+        return web.json_response(state_payload())
+
+    scan = {"on": False}                              # True while the startup scan is looking for printers
+
+    def printer_list():
+        """Saved printers (id, name, ip and the four ports each). Always contains the active one."""
+        lst = cfg.get("printers") or []
+        if not lst and (scan["on"] or cfg.get("printers_configured")):
+            return []             # still scanning for printers, or the user deleted every printer: nothing to show or connect to
+        if not any(x["id"] == cfg.get("active_printer") for x in lst):
+            name = (printer().attributes or {}).get("Name") if "printer" in app else None
+            seed = normalize_printers([{"name": name or "Printer", "ip": cfg["printer_ip"], **{k: cfg[k] for k in PRINTER_PORTS if k in cfg}}])[0]
+            cfg["printers"] = lst = [seed] + [x for x in lst]
+            cfg["active_printer"] = seed["id"]
+        return lst
+
+    def active_printer():
+        return next((x for x in printer_list() if x["id"] == cfg.get("active_printer")), None)
+
+    def save_config(updates):
+        path = Path(os.environ.get("SATURN_CONFIG") or ROOT / "config.json")
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        data.update(updates)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return path
+
+    def active_updates():
+        a = active_printer()
+        if a is None:
+            return {"printers": [], "printers_configured": True, "active_printer": "", "printer_ip": ""}
+        return {"printers": printer_list(), "printers_configured": True, "active_printer": a["id"], "printer_ip": a["ip"],
+                "printer_port": a["printer_port"], "video_port": a["video_port"], "udp_port": a["udp_port"]}
+
+    async def drop_camera():
+        """Stop our camera stream and tell the printer we are done with it."""
+        t = hub["task"]
+        if hub["off"]:
+            hub["off"].cancel()
+            hub["off"] = None
+        if t:
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+    async def leave_printer():
+        """Before moving to another printer (or another address): stop our camera stream and free its slot."""
+        p = printer()
+        try:
+            await asyncio.wait_for(drop_camera(), 5)
+            if p.connected:
+                await asyncio.wait_for(p.enable_video(False), 3)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def apply_active():
+        """Point the running app at the active saved printer."""
+        a = active_printer()
+        if a is None:                                # no printers left: disconnect and idle
+            cfg["printer_ip"] = ""
+            printer().reconfigure("")
+            return
+        same = printer().ip == a["ip"] and printer().port == a["printer_port"]     # e.g. the scan found the printer we are already on
+        cfg.update(printer_ip=a["ip"], printer_port=a["printer_port"], video_port=a["video_port"], udp_port=a["udp_port"])
+        if not same:
+            printer().port = a["printer_port"]
+            printer().reconfigure(a["ip"])
+
+    def upload_running():
+        up = printer().upload
+        return bool(up and up.get("phase") in ("sending", "verifying")) or bool(printer().queue)
+
+    def printer_label(d):
+        return str(d.get("Name") or d.get("MachineName") or "").strip()
+
+    async def scan_printers(timeout=2.5):
+        """UDP scan: broadcast, plus the subnet broadcast and a direct ask for every printer we already know."""
+        targets = [("255.255.255.255", cfg.get("udp_port", 3000))]
+        for x in list(cfg.get("printers") or []) + [{"ip": cfg.get("printer_ip"), "udp_port": cfg.get("udp_port", 3000)}]:
+            ip = str(x.get("ip") or "")
+            if ip.count(".") == 3:
+                port = int(x.get("udp_port") or cfg.get("udp_port", 3000))
+                for t in ((ip.rsplit(".", 1)[0] + ".255", port), (ip, port)):
+                    if t not in targets:
+                        targets.append(t)
+        return await discover(timeout=timeout, targets=targets)
+
+    async def fill_names(raw):
+        """New printers added without a name get the name the printer itself reports."""
+        async def one(x):
+            ip = str(x.get("ip", "")).strip()
+            try:
+                port = int(x.get("udp_port") or cfg.get("udp_port", 3000))
+                found = await discover(ip, port, timeout=1.5)
+            except Exception:  # noqa: BLE001
+                return
+            name = next((printer_label(d) for d in found if printer_label(d)), "")
+            if name:
+                x["name"] = name
+        await asyncio.gather(*[one(x) for x in raw if not str(x.get("name", "")).strip()])
+
+    def autoname_active():
+        """The active printer has no name yet (it shows its IP): take the name it reports."""
+        a = active_printer() if not (cfg.get("printers_configured") and not cfg.get("printers")) else None
+        n = str((printer().attributes or {}).get("Name") or "").strip()
+        if a and n and printer().connected and a["name"] == a["ip"]:
+            a["name"] = n
+            try:
+                save_config({"printers": printer_list()})
+            except OSError:
+                pass
+
+    @routes.post("/api/printers")
+    async def save_printers(request):
+        b = await request.json()
+        import ipaddress
+        raw = b.get("printers") or []
+        for x in raw:
+            ip = str(x.get("ip", "")).strip()
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return jerr(f"'{ip}' is not a valid IP address")
+            for k in PRINTER_PORTS:
+                if x.get(k) not in (None, ""):
+                    try:
+                        if not 1 <= int(x[k]) <= 65535:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        return jerr(f"'{x[k]}' is not a valid port number")
+        await fill_names(raw)
+        cleaned = normalize_printers(raw)
+        old = active_printer()
+        new_active = next((x for x in cleaned if old and x["id"] == old["id"]), None)
+        if not cleaned:
+            changed = old is not None
+        else:
+            changed = old is None or new_active is None or any(new_active[k] != old[k] for k in ("ip", *PRINTER_PORTS))
+        if changed and upload_running():
+            return jerr("An upload is in progress; wait for it to finish before changing the active printer", 409)
+        cfg["printers"] = cleaned
+        cfg["printers_configured"] = True
+        cfg["active_printer"] = (new_active or cleaned[0])["id"] if cleaned else ""
+        try:
+            save_config(active_updates())
+        except OSError as e:
+            return jerr(f"Could not save the config: {e}", 500)
+        if changed:
+            await leave_printer()
+            apply_active()
+        return web.json_response({"ok": True, "printers": printer_list(), "active_printer": cfg["active_printer"], "switched": changed})
+
+    @routes.post("/api/printers/select")
+    async def select_printer(request):
+        b = await request.json()
+        pid = str(b.get("id", ""))
+        if pid not in [x["id"] for x in printer_list()]:
+            return jerr("That printer is not in the list")
+        if pid == cfg["active_printer"]:
+            return web.json_response({"ok": True, "active_printer": pid, "printers": printer_list()})
+        if upload_running():
+            return jerr("An upload is in progress; wait for it to finish before switching printers", 409)
+        await leave_printer()
+        cfg["active_printer"] = pid
+        try:
+            save_config(active_updates())
+        except OSError as e:
+            return jerr(f"Could not save the config: {e}", 500)
+        apply_active()
+        return web.json_response({"ok": True, "active_printer": pid, "printers": printer_list()})
 
     @routes.get("/api/config")
     async def get_config(request):
-        return web.json_response({"printer_ip": cfg["printer_ip"], "printer_port": cfg["printer_port"],
+        return web.json_response({"printer_ip": cfg["printer_ip"], "printers": printer_list(), "active_printer": cfg["active_printer"], "printer_port": cfg["printer_port"],
                                   "video_port": cfg["video_port"],
                                   "light_enabled": bool(cfg.get("light_enabled")),
                                   "render_folder": cfg.get("render_folder", "")})
@@ -100,30 +320,38 @@ def create_app(cfg=None):
     @routes.post("/api/settings")
     async def save_settings(request):
         b = await request.json()
-        ip = (b.get("printer_ip") or "").strip() or cfg["printer_ip"]
-        import ipaddress
-        try:
-            ipaddress.ip_address(ip)
-        except ValueError:
-            return jerr("That is not a valid IP address")
+        ip = (b.get("printer_ip") or "").strip()          # optional: only the render folder may be sent
+        if ip:
+            import ipaddress
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return jerr("That is not a valid IP address")
         render_folder = b.get("render_folder")
         if render_folder is not None:
             render_folder = str(render_folder).strip().strip('"')
         path = Path(os.environ.get("SATURN_CONFIG") or ROOT / "config.json")
         try:
             data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-            data["printer_ip"] = ip
+            if ip:
+                data["printer_ip"] = ip
+                for x in cfg.get("printers") or []:           # keep the saved entry of the active printer in step
+                    if x["id"] == cfg.get("active_printer"):
+                        x["ip"] = ip
+                if cfg.get("printers"):
+                    data["printers"] = cfg["printers"]
             if render_folder is not None:
                 data["render_folder"] = render_folder
             path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as e:
             return jerr(f"Could not save {path}: {e}", 500)
-        if ip != printer().ip:
-            printer().reconfigure(ip)
-        cfg["printer_ip"] = ip
+        if ip:
+            if ip != printer().ip:
+                printer().reconfigure(ip)
+            cfg["printer_ip"] = ip
         if render_folder is not None:
             cfg["render_folder"] = render_folder
-        return web.json_response({"ok": True, "printer_ip": ip, "render_folder": cfg.get("render_folder", ""),
+        return web.json_response({"ok": True, "printer_ip": cfg["printer_ip"], "render_folder": cfg.get("render_folder", ""),
                                   "saved_to": str(path)})
 
     # ---------------------------------------------------------------- live updates
@@ -136,7 +364,7 @@ def create_app(cfg=None):
             t.cancel()
             app["exit_task"] = None
         try:
-            await ws.send_json({"type": "state", "state": printer().public_state()})
+            await ws.send_json({"type": "state", "state": state_payload()})
             await ws.send_json({"type": "log_init", "entries": list(printer().log)[-300:]})
             app["clients"].add(ws)
             async for _ in ws:
@@ -151,9 +379,8 @@ def create_app(cfg=None):
         """Last browser tab closed: wait a few seconds (page reloads reconnect), then quit the app."""
         await asyncio.sleep(float(cfg.get("auto_exit_seconds", 10)))
         while app["clients"] == set():
-            up = printer().upload
-            if up and up.get("phase") in ("sending", "verifying"):
-                await asyncio.sleep(2)       # never quit in the middle of an upload
+            if upload_running():
+                await asyncio.sleep(2)       # never quit in the middle of an upload (or with files still queued)
                 continue
             printer().note("Browser closed - shutting down")
             asyncio.get_running_loop().call_soon(_raise_exit)
@@ -169,9 +396,10 @@ def create_app(cfg=None):
             except asyncio.TimeoutError:
                 pass
             app["dirty"].clear()
+            autoname_active()
             pending, app["logq"][:] = list(app["logq"]), []
             if app["clients"]:
-                payloads = [json.dumps({"type": "state", "state": printer().public_state()})]
+                payloads = [json.dumps({"type": "state", "state": state_payload()})]
                 if pending:
                     payloads.append(json.dumps({"type": "log", "entries": pending}))
                 for ws in list(app["clients"]):
@@ -301,7 +529,7 @@ def create_app(cfg=None):
 
     @routes.post("/api/discover")
     async def do_discover(request):
-        found = await discover(timeout=2.0)
+        found = await scan_printers(2.5)
         return web.json_response({"ok": True, "printers": found})
 
     # ---------------------------------------------------------------- files
@@ -406,11 +634,98 @@ def create_app(cfg=None):
         return web.json_response({"ok": True, "items": items, "total": total})
 
     # ---------------------------------------------------------------- upload
+    # Uploads go through a queue: one file is sent at a time, the rest wait their turn.
+    async def run_item(p, item):
+        """Send one queued file (and start the print afterwards if asked)."""
+        try:
+            md5 = item.get("md5")
+            if not md5:             # render files are hashed when their turn comes, so queueing is instant
+                def hash_file():
+                    h = hashlib.md5()
+                    with open(item["path"], "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                    return h.hexdigest()
+                md5 = await asyncio.get_running_loop().run_in_executor(None, hash_file)
+            if not p.connected:
+                p.upload = {"id": item["id"], "name": item["name"], "total": item["size"], "sent": 0, "phase": "error",
+                            "error": "Not connected to the printer", "started": time.time(), "print_after": False}
+                p.on_change()
+                return p.upload
+            up = await p.upload_file(item["path"], item["name"], item["size"], md5, item.get("print_after", False))
+            if up["phase"] == "done" and item.get("print_after"):
+                await asyncio.sleep(1.0)
+                fname = item["name"]
+                for base in ("/local/", "/usb/"):
+                    try:
+                        items, _ = await p.list_files(base)
+                    except PrinterError:
+                        continue
+                    match = next((f for f in items if f["name"] == fname and not f["is_dir"]), None)
+                    if match:
+                        ok, ack, msg, _ = await p.command(CMD["START"], {"Filename": match["path"], "StartLayer": 0}, 20)
+                        if not ok:
+                            up["error"] = f"Uploaded, but print did not start: {msg}"
+                        break
+                else:
+                    up["error"] = "Uploaded, but could not find the file to start printing"
+                p.on_change()
+            return up
+        finally:
+            if item.get("tmpdir"):
+                shutil.rmtree(item["tmpdir"], ignore_errors=True)
+
+    async def queue_worker(p):
+        try:
+            while p.queue:
+                item = p.queue.pop(0)
+                await p.refresh_space()          # baseline free space for this file (printer is idle between files)
+                t = asyncio.create_task(run_item(p, item))
+                app["upload_task"] = t
+                p.on_change()
+                await asyncio.wait({t})          # a cancelled upload just moves on to the next file
+                up = None if t.cancelled() or t.exception() else t.result()
+                if up and up.get("phase") == "error" and p.queue:
+                    dropped = len(p.queue)       # something is wrong (offline, full...): do not hammer the printer
+                    for q in p.queue:
+                        if q.get("tmpdir"):
+                            shutil.rmtree(q["tmpdir"], ignore_errors=True)
+                    p.queue.clear()
+                    p.note(f"Upload failed: {dropped} queued file(s) removed", "error")
+                p.on_change()
+        finally:
+            app["queue_task"] = None
+            p.on_change()
+
+    def enqueue(p, item):
+        item["id"] = uuid.uuid4().hex
+        p.queue.append(item)
+        t = app.get("queue_task")
+        if not t or t.done():
+            app["queue_task"] = asyncio.create_task(queue_worker(p))
+        p.on_change()
+
+    @routes.post("/api/upload/check")
+    async def upload_check(request):
+        """How much room is there for these sizes (on top of what is already uploading/queued)?"""
+        p = printer()
+        b = await request.json()
+        if not p.connected:
+            return jerr("Not connected to the printer", 502)
+        if not upload_running():                  # idle: the printer's own number is the truth
+            await p.refresh_space()
+        sp = p.space_info()
+        add = sum(int(x) for x in b.get("sizes") or [])
+        out = {"ok": True, "known": sp["free"] is not None, "free": sp["free"], "add": add}
+        if sp["free"] is not None:
+            out["after_now"] = sp["after"]                      # what is left once everything already in line is done
+            out["after"] = sp["after"] - add                    # ...and with these files too
+            out["over"] = out["after"] < 0
+        return web.json_response(out)
+
     @routes.post("/api/upload")
     async def upload(request):
         p = printer()
-        if p.upload and p.upload.get("phase") in ("sending", "verifying"):
-            return jerr("An upload is already in progress", 409)
         if not p.connected:
             return jerr("Not connected to the printer", 502)
         tmpdir = tempfile.mkdtemp(prefix="saturn-up-")
@@ -439,30 +754,7 @@ def create_app(cfg=None):
         if not tmp or size == 0:
             shutil.rmtree(tmpdir, ignore_errors=True)
             return jerr("No file received")
-
-        async def job():
-            try:
-                up = await p.upload_file(tmp, fname, size, md5, print_after)
-                if up["phase"] == "done" and print_after:
-                    await asyncio.sleep(1.0)
-                    for base in ("/local/", "/usb/"):
-                        try:
-                            items, _ = await p.list_files(base)
-                        except PrinterError:
-                            continue
-                        match = next((f for f in items if f["name"] == fname and not f["is_dir"]), None)
-                        if match:
-                            ok, ack, msg, _ = await p.command(CMD["START"], {"Filename": match["path"], "StartLayer": 0}, 20)
-                            if not ok:
-                                up["error"] = f"Uploaded, but print did not start: {msg}"
-                            break
-                    else:
-                        up["error"] = "Uploaded, but could not find the file to start printing"
-                    p.on_change()
-            finally:
-                shutil.rmtree(tmpdir, ignore_errors=True)
-
-        app["upload_task"] = asyncio.create_task(job())
+        enqueue(p, {"name": fname, "size": size, "md5": md5, "path": tmp, "tmpdir": tmpdir, "print_after": print_after})
         return web.json_response({"ok": True, "name": fname, "size": size, "md5": md5}, status=202)
 
     @routes.post("/api/upload/cancel")
@@ -472,6 +764,19 @@ def create_app(cfg=None):
             t.cancel()
             return web.json_response({"ok": True})
         return jerr("No upload running", 409)
+
+    @routes.post("/api/upload/queue/remove")
+    async def queue_remove(request):
+        p = printer()
+        b = await request.json()
+        ids = {b["id"]} if b.get("id") else {q["id"] for q in p.queue}       # no id = clear the whole queue
+        gone = [q for q in p.queue if q["id"] in ids]
+        p.queue[:] = [q for q in p.queue if q["id"] not in ids]
+        for q in gone:
+            if q.get("tmpdir"):
+                shutil.rmtree(q["tmpdir"], ignore_errors=True)
+        p.on_change()
+        return web.json_response({"ok": True, "removed": len(gone)})
 
     # ---------------------------------------------------------------- render upload (local .goo folder)
     def render_root():
@@ -522,6 +827,48 @@ def create_app(cfg=None):
         here = "" if target == root else target.relative_to(root).as_posix()
         return web.json_response({"ok": True, "root": str(root), "path": here, "entries": entries})
 
+    @routes.get("/api/render/printer-files")
+    async def render_printer_files(request):
+        """Name + size of every model file on the printer (its HTTP print-files folder and the SDCP /local/ and /usb/ lists)."""
+        p = printer()
+        if not p.connected:
+            return jerr("Not connected to the printer", 502)
+        found, errors = {}, []
+
+        def add(name, size):
+            found[(unquote(name), size)] = True
+
+        async def walk_http(path, depth):
+            url = f"http://{p.ip}:{p.port}{quote(path, safe='/')}"
+            async with p.session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status != 200:
+                    raise PrinterError(f"HTTP {r.status} for {path}")
+                page = (await r.read()).decode("utf-8", "replace")
+            for e in parse_listing(page):
+                if e["is_dir"]:
+                    if depth < 3:
+                        await walk_http(path + e["name"] + "/", depth + 1)
+                elif e.get("size") is not None:
+                    add(e["name"], int(e["size"]))
+
+        async def walk_sdcp(path, depth):
+            items, _ = await p.list_files(path)
+            for f in items:
+                if f["is_dir"]:
+                    if depth < 3:
+                        await walk_sdcp(f["path"].rstrip("/") + "/", depth + 1)
+                elif f.get("size") is not None:
+                    add(f["name"], int(f["size"]))
+
+        for walker, base in ((walk_http, "/media/mmcblk0p3/"), (walk_sdcp, "/local/"), (walk_sdcp, "/usb/")):
+            try:
+                await walker(base, 0)
+            except (PrinterError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                errors.append(f"{base}: {e}")
+        if not found and errors:
+            return jerr("Could not read the printer's files: " + "; ".join(errors), 502)
+        return web.json_response({"ok": True, "files": [{"name": n, "size": s} for n, s in found]})
+
     @routes.post("/api/render/upload")
     async def render_upload(request):
         p = printer()
@@ -533,26 +880,13 @@ def create_app(cfg=None):
             return jerr("That path is outside the render folder", 403)
         if not target.is_file() or target.suffix.lower() != ".goo":
             return jerr("File not found (only .goo files can be uploaded from here)", 404)
-        if p.upload and p.upload.get("phase") in ("sending", "verifying"):
-            return jerr("An upload is already in progress", 409)
         if not p.connected:
             return jerr("Not connected to the printer", 502)
         size = target.stat().st_size
         if size == 0:
             return jerr("That file is empty")
-
-        def hash_file():
-            h = hashlib.md5()
-            with open(target, "rb") as f:
-                for chunk in iter(lambda: f.read(1 << 20), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        md5 = await asyncio.get_running_loop().run_in_executor(None, hash_file)
-
-        async def job():
-            await p.upload_file(str(target), target.name, size, md5, False)
-        app["upload_task"] = asyncio.create_task(job())
-        return web.json_response({"ok": True, "name": target.name, "size": size, "md5": md5}, status=202)
+        enqueue(p, {"name": target.name, "size": size, "path": str(target), "print_after": False})
+        return web.json_response({"ok": True, "name": target.name, "size": size}, status=202)
 
     # ---------------------------------------------------------------- proxying printer-hosted resources
     IMG_EXT = (".bmp", ".png", ".jpg", ".jpeg", ".gif")
@@ -797,16 +1131,7 @@ def create_app(cfg=None):
     @routes.post("/api/camera/release")
     async def camera_release(request):
         """Drop our stream (stops ffmpeg politely) and tell the printer we are done with the camera."""
-        t = hub["task"]
-        if hub["off"]:
-            hub["off"].cancel()
-            hub["off"] = None
-        if t:
-            t.cancel()
-            try:
-                await t
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        await drop_camera()
         try:
             await printer().enable_video(False)
             await printer().request(CMD["ATTRIBUTES"], timeout=4, quiet=True)
@@ -837,13 +1162,55 @@ def create_app(cfg=None):
             d.set()
 
     async def on_startup(app_):
+        LOOP["loop"] = asyncio.get_running_loop()
         app["dirty"] = asyncio.Event()
         app["printer"] = PrinterClient(cfg, on_change, on_log)
         await app["printer"].start()
         app["bcast"] = asyncio.create_task(broadcaster())
+        if not cfg.get("printers"):
+            scan["on"] = True
+            app["scan_task"] = asyncio.create_task(startup_scan())
+
+    async def startup_scan():
+        """No printers saved yet: scan the network and add every printer that answers."""
+        try:
+            await asyncio.sleep(0.5)
+            found = await scan_printers(2.5)
+            have = {x["ip"] for x in cfg.get("printers") or []}
+            fresh = []
+            for d in found:
+                ip = str(d.get("MainboardIP") or "").strip()
+                if ip and ip not in have:
+                    have.add(ip)
+                    fresh.append({"name": printer_label(d), "ip": ip})
+            if not fresh:
+                return
+            ports = {k: cfg[k] for k in PRINTER_PORTS if k in cfg}
+            entries = normalize_printers(fresh, ports)
+            had_active = bool(cfg.get("active_printer")) and any(x["id"] == cfg["active_printer"] for x in cfg.get("printers") or [])
+            cfg["printers"] = list(cfg.get("printers") or []) + entries
+            cfg["printers_configured"] = True
+            if not had_active:
+                cfg["active_printer"] = entries[0]["id"]
+            printer().note("Scan found " + ", ".join(f"{e['name']} @ {e['ip']}" for e in entries))
+            try:
+                save_config(active_updates())
+            except OSError:
+                pass
+            if not had_active:
+                apply_active()
+            on_change()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            printer().note(f"Startup scan failed: {e}", "error")
+        finally:
+            scan["on"] = False
 
     async def on_cleanup(app_):
         app["bcast"].cancel()
+        if app.get("scan_task"):
+            app["scan_task"].cancel()
         t = hub["task"]
         if t:
             t.cancel()
@@ -856,6 +1223,7 @@ def create_app(cfg=None):
         except Exception:  # noqa: BLE001
             pass
         await app["printer"].stop()
+        CLEANED.set()
 
     app.router.add_routes(routes)
     app.router.add_static("/static", STATIC, show_index=False)
@@ -879,6 +1247,7 @@ def main():
         import threading
         import webbrowser
         threading.Timer(1.5, webbrowser.open, args=[f"http://localhost:{port}"]).start()
+    install_console_close_handler()
     web.run_app(create_app(cfg), host=host, port=port, print=None)
 
 

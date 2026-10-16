@@ -63,6 +63,7 @@ STOP_REASONS = {
 TASK_STATUS = {0: "Other", 1: "Completed", 2: "Error", 3: "Stopped"}
 
 CHUNK = 1024 * 1024
+LIVE_SPEED_WINDOW = 3.0       # seconds of upload the "current speed" is averaged over
 
 
 def _norm(k):
@@ -187,6 +188,8 @@ class PrinterClient:
         self.light_variant = None   # name of the light message variant the printer answered, if any
         self._fi = (0, {})
         self.upload = None          # dict describing the current/last upload
+        self.queue = []             # uploads waiting their turn (dicts: id, name, size, path, ...)
+        self.space_free = None      # free bytes on the printer before the current upload started (None = unknown)
         self.light = None           # optimistic light state (True/False/None)
         self.known_params = {}      # print settings this app changed (the local protocol does not report them)
         self.known_task = None
@@ -227,6 +230,10 @@ class PrinterClient:
     # ------------------------------------------------------------ connection
     async def _run(self):
         while True:
+            if not self.ip:                      # every saved printer was deleted: stay idle until one is added
+                self.last_error = "No printer set up"
+                await asyncio.sleep(1)
+                continue
             try:
                 await self._connect_once()
             except asyncio.CancelledError:
@@ -590,6 +597,11 @@ class PrinterClient:
         self.mainboard_id = ""
         self._hist_cache = (0, [])
         self._fi = (0, {})
+        self.status, self.attributes = {}, {}      # nothing from the previous printer may linger on screen
+        self.upload = self.light = self.known_task = self.video_url = None
+        self.queue, self.space_free = [], None
+        self.known_params = {}
+        self.video_enabled = False
         self.note(f"Printer IP changed to {ip}")
         if self.ws and not self.ws.closed:
             asyncio.ensure_future(self.ws.close())
@@ -613,8 +625,9 @@ class PrinterClient:
         """Push a local file to the printer in 1 MB chunks."""
         up = {"id": uuid.uuid4().hex, "name": filename, "total": size, "sent": 0,
               "phase": "sending", "error": None, "started": time.time(),
-              "print_after": print_after}
+              "print_after": print_after, "speed_avg": None, "speed_now": None}
         self.upload = up
+        samples = deque([(up["started"], 0)])      # (time, bytes sent) for the live speed
         self.note(f"Upload started: {filename} ({size} bytes, md5 {md5})")
         self.on_change()
         file_uuid = uuid.uuid4().hex
@@ -641,11 +654,21 @@ class PrinterClient:
                         raise PrinterError("Upload rejected: " + _upload_error(js))
                     offset += len(chunk)
                     up["sent"] = offset
+                    now = time.time()
+                    samples.append((now, offset))
+                    while len(samples) > 2 and now - samples[1][0] >= LIVE_SPEED_WINDOW:
+                        samples.popleft()
+                    if now > up["started"]:
+                        up["speed_avg"] = offset / (now - up["started"])
+                    t0, b0 = samples[0]
+                    if now > t0:
+                        up["speed_now"] = (offset - b0) / (now - t0)
                     self.note(f"Upload chunk ok: {offset}/{size} bytes", "debug")
                     self.on_change()
                     if offset >= size:
                         break
             up["phase"] = "verifying"
+            up["speed_now"] = None
             self.on_change()
             await self._wait_transfer_done()
             up["phase"] = "done"
@@ -664,6 +687,33 @@ class PrinterClient:
             await self._abort_transfer(file_uuid, filename)
             self.on_change()
         return up
+
+    def space_info(self):
+        """Free space on the printer now, and what will be left once the current upload and the queue are done."""
+        if self.space_free is None:
+            return {"free": None, "after": None}
+        up = self.upload
+        running = up and up.get("phase") in ("sending", "verifying")
+        used = (up["total"] if running else 0) + sum(q["size"] for q in self.queue)
+        return {"free": self.space_free, "after": self.space_free - used}
+
+    async def refresh_space(self):
+        """Read the free space of the printer's internal storage. The file list reports it on some firmwares;
+        otherwise the printer's own "RemainingMemory" attribute (what the machine settings show) is used."""
+        free = None
+        try:
+            _, st = await self.list_files("/local/")
+            if st and st.get("total"):
+                free = st["total"] - st["used"]
+        except Exception:  # noqa: BLE001
+            pass
+        if free is None:
+            rem = (self.attributes or {}).get("RemainingMemory")
+            if isinstance(rem, (int, float)) and rem >= 0:
+                free = int(rem)
+        self.space_free = free
+        self.on_change()
+        return free
 
     async def _wait_transfer_done(self):
         for _ in range(120):
@@ -725,6 +775,9 @@ class PrinterClient:
             "progress": (cl / tl * 100.0) if tl else 0,
             "remaining_ms": max(total_t - cur_t, 0) if total_t else None,
             "upload": self.upload,
+            "queue": [{"id": q["id"], "name": q["name"], "size": q["size"], "print_after": q.get("print_after", False)}
+                      for q in self.queue],
+            "space": self.space_info(),
             "light": self.light,
             "print_params": self._print_params(),
             "light_variant": self.light_variant,
@@ -766,15 +819,20 @@ def multipart_body(fields, file_field, filename, payload):
     return bytes(out), f"multipart/form-data; boundary={boundary}"
 
 
-async def discover(target="255.255.255.255", port=3000, timeout=2.0):
-    """UDP discovery: send 'M99999' and collect replies. Returns list of Data dicts."""
+async def discover(target="255.255.255.255", port=3000, timeout=2.0, targets=None):
+    """UDP discovery: send 'M99999' (to every (host, port) in `targets`, default just target:port) and collect
+    replies. Returns list of Data dicts, one per printer."""
     loop = asyncio.get_running_loop()
     found, ids = [], set()
 
     class Proto(asyncio.DatagramProtocol):
         def connection_made(self, transport):
             self.t = transport
-            transport.sendto(b"M99999", (target, port))
+            for host, p in (targets or [(target, port)]):
+                try:
+                    transport.sendto(b"M99999", (host, p))
+                except OSError:
+                    pass
 
         def datagram_received(self, data, addr):
             try:

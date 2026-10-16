@@ -8,7 +8,7 @@ A local web UI (Fluidd-style) for an Elegoo Saturn 4 Ultra, using Elegoo's SDCP 
    First run creates a `.venv` and installs `aiohttp`; later runs just launch. The browser opens at http://localhost:8080.
 
 ## Config (`config.json`)
-- `printer_ip` - **the one place the printer IP lives** (192.168.0.189).
+- `printer_ip` - the active printer's IP (blank on a fresh install; the app finds it by scanning the network). `printers` - the saved list shown in the status dropdown (edit it in the gear settings). Each entry is `{id, name, ip, printer_port, video_port, udp_port, web_port}` (the name is yours per printer; left blank it is filled in from what the printer reports). With no printers saved, the app scans the network on start and adds what answers; the three non-printer ports are only editable here. `active_printer` is the id in use.
 - `auto_exit` - `true` (default): the app quits by itself a few seconds after you close the browser tab (never mid-upload), and the launcher window closes. Set `false` to keep it running.
 - `web_host` - `127.0.0.1` = this PC only. Use `0.0.0.0` to open it from your phone/other PCs on the LAN (no password, so LAN only).
 - `web_port`, `printer_port` (3030), `video_port` (3031), `udp_port` (3000), `mainboard_id` (auto-detected).
@@ -27,10 +27,10 @@ and a Fluidd-style Console under the page: a live, timestamped log of every comm
 
 Also: an **Explorer** tab (read-only tree view of the printer's own web server on port 3030: back/forward/up/refresh, sortable, local-time dates, KB/MB sizes, view text/images, download through the app), Files tab details filled from the printer's `file_info.txt`, a badge for files uploaded with `%20` in the name, a toggle to show/delete incomplete upload fragments, vat temperature and film use, and camera slot count with a Release button.
 
-Also: a **Render upload** tab (same look as Explorer, but it browses a folder on the PC running the app: a tree of subfolders and the `.goo` files inside them). Click **Upload** to the right of a file name, or double-click the row, confirm the file name in the popup, and it is sent straight to the printer with the same progress/cancel as the Files tab. It can only see inside the configured render folder.
+Also: a **Render upload** tab (same look as Explorer, but it browses a folder on the PC running the app: a tree of subfolders and the `.goo` files inside them). Click **Upload** to the right of a file name, or double-click the row, confirm the file name in the popup, and it is sent straight to the printer. An **Uploaded** column shows Yes/No for whether a file with the same name and size is already on the printer with the same progress/cancel as the Files tab. Uploads queue up (the button becomes **＋ Queue** while one is running), the dialog checks the printer's free space (with a Force upload option), and the upload box shows average and current speed. It can only see inside the configured render folder.
 
-## Changing the printer IP / render folder
-Click the gear icon (top right), enter the new IP and/or the Render upload folder, Save. Both are written to `config.json` and take effect immediately.
+## Printers / render folder
+Click the gear icon (top right) to add printers (name + IP), delete them, and set the Render upload folder; Save writes `config.json`. To switch printer, click the status text at the top left (**Connected · <printer IP> ▾**) and pick one. `printer_ip` in `config.json` is the active printer; `printers` is the saved list.
 
 ## Things that depend on your printer's firmware
 - **File layer height / layers / time / thumbnail**: the public SDCP spec only returns name, size and type in the

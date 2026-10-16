@@ -43,7 +43,8 @@ async def main(minimal=False):
                SATURN_VIDEO_PORT=str(PORTS["video"]), SATURN_UDP_PORT=str(PORTS["udp"]),
                SATURN_WEB_PORT=str(PORTS["web"]), SATURN_CONFIG=cfgfile)
     mock_args = [sys.executable, str(ROOT / "tools/mock_printer.py"), "--port", str(PORTS["printer"]),
-                 "--video-port", str(PORTS["video"]), "--udp-port", str(PORTS["udp"]), "--idle-kill", "4"]
+                 "--video-port", str(PORTS["video"]), "--udp-port", str(PORTS["udp"]), "--idle-kill", "4",
+                 "--host", "0.0.0.0"]      # 0.0.0.0 so the multi-printer test can reach it as a second address (127.0.0.2)
     if minimal:
         mock_args.append("--minimal")
     mock = subprocess.Popen(mock_args)
@@ -161,12 +162,52 @@ async def main(minimal=False):
             r = await post("/api/render/upload", {"path": "Arthas/notes.txt"})
             check("render upload refuses non-.goo", not r["ok"], r)
             r = await post("/api/render/upload", {"path": "Arthas/parts/Arthas Base.goo"})
-            check("render upload accepted", r["ok"] and r["md5"] == hashlib.md5(gpay).hexdigest(), r)
+            check("render upload accepted", r["ok"] and r["size"] == len(gpay), r)
             await asyncio.sleep(0.5)
             x = await wait_for(up_done, 20)
             check("render upload completes", x and x["upload"]["phase"] == "done" and x["upload"]["name"] == "Arthas Base.goo", x and x["upload"])
             _, ctl = await post_raw("/_mock/state", {})
             check("render upload reaches printer under plain file name", ctl["last_upload_name"] == "Arthas Base.goo", ctl["last_upload_name"])
+            _, pf = await get("/api/render/printer-files")
+            have = {(f["name"], f["size"]) for f in pf["files"]}
+            check("printer-files lists the uploaded render with its size", ("Arthas Base.goo", len(gpay)) in have, sorted(have)[:8])
+            check("printer-files has no entry for a render that was never uploaded", ("top.goo", 1000) not in have)
+
+            # queue: files wait their turn, can be removed, speeds and the free-space check
+            _, sp = await get("/api/files?path=/local/")
+            r = await post("/api/upload/check", {"sizes": [1000]})
+            check("space check answers", r["ok"] and "known" in r, r)
+            if r.get("known"):
+                r2 = await post("/api/upload/check", {"sizes": [r["free"] + 1]})
+                check("space check flags a too-big upload", r2["over"] and r2["after"] == -1, r2)
+                check("space check passes a small upload", not r["over"], r)
+            bigs = []
+            for i in range(3):
+                data = os.urandom(25_000_000 if i == 0 else 300_000)
+                fd = aiohttp.FormData(); fd.add_field("print_after", "0"); fd.add_field("file", data, filename=f"queue_{i}.ctb")
+                async with s.post(BASE + "/api/upload", data=fd) as rr:
+                    bigs.append(await rr.json())
+            check("three uploads accepted", all(b.get("ok") for b in bigs), bigs)
+            _, x = await get("/api/state")
+            qn = [q["name"] for q in x["queue"]]
+            check("second and third wait in the queue", qn == ["queue_1.ctb", "queue_2.ctb"], qn)
+            check("first one is sending", x["upload"]["name"] == "queue_0.ctb", x["upload"])
+            r = await post("/api/upload/queue/remove", {"id": x["queue"][1]["id"]})
+            check("queued file can be removed", r["ok"] and r["removed"] == 1, r)
+            seen = {}
+
+            async def queue_done():
+                _, y = await get("/api/state")
+                u = y["upload"]
+                if u and u["name"] == "queue_0.ctb" and u.get("speed_avg") and u["phase"] == "sending":
+                    seen["avg"], seen["now"] = u["speed_avg"], u.get("speed_now")
+                return y if u and u["name"] == "queue_1.ctb" and u["phase"] in ("done", "error") else None
+            y = await wait_for(queue_done, 30)
+            check("queue runs the next file after the first", y and y["upload"]["phase"] == "done" and y["queue"] == [], y and (y["upload"], y["queue"]))
+            _, j = await get("/api/files?path=/local/")
+            names = [f["name"] for f in j["files"]]
+            check("queued files reached the printer; removed one did not", "queue_0.ctb" in names and "queue_1.ctb" in names and "queue_2.ctb" not in names, names)
+            check("upload reports speeds", y["upload"].get("speed_avg") and y["upload"]["speed_avg"] > 0, y["upload"])
 
             # print control
             r = await post("/api/print", {"filename": "/local/missing.ctb"})
@@ -319,6 +360,71 @@ async def main(minimal=False):
                 while m3["type"] != "log":
                     m3 = await asyncio.wait_for(ws.receive_json(), 5)
                 check("live log entries stream to browser", any("Cmd 129" in e["text"] for e in m3["entries"]), m3)
+
+            # multiple printers
+            async def scanned():
+                _, cc = await get("/api/config")
+                return cc if cc["printers"] else None
+            c = await wait_for(scanned, 10)
+            first = c["printers"][0]
+            check("startup scan added the printer that answered (named by the printer)", first["name"] == "Saturn 4 Ultra (mock)" and first["ip"] == "127.0.0.1", c["printers"])
+            _, st_ = await get("/api/state")
+            check("state carries the active printer's saved name", st_["printer_name"] == "Saturn 4 Ultra (mock)", st_.get("printer_name"))
+            r = await post("/api/discover")
+            check("scan lists every printer that answered", r["ok"] and [p["MainboardIP"] for p in r["printers"]] == ["127.0.0.1"], r)
+            check("config lists the active printer with all four ports", [x["ip"] for x in c["printers"]] == ["127.0.0.1"] and c["active_printer"] == first["id"]
+                  and (first["video_port"], first["udp_port"], first["web_port"]) == (PORTS["video"], PORTS["udp"], PORTS["web"]) and first["printer_port"] == PORTS["printer"], c["printers"])
+            r = await post("/api/printers", {"printers": [{**first, "name": "Resin 1"}, {"name": "Resin 2", "ip": "127.0.0.2", "printer_port": PORTS["printer"], "video_port": PORTS["video"], "udp_port": PORTS["udp"]}]})
+            two = next((x for x in r.get("printers", []) if x["name"] == "Resin 2"), {})
+            check("save printer list (ids and default ports filled in)", r["ok"] and not r["switched"] and two.get("id") and two.get("web_port") == 8080, r)
+            r = await post("/api/printers", {"printers": [{**first}, {**two, "name": ""}]})
+            check("a printer added without a name gets the name it reports", r["ok"] and next(x for x in r["printers"] if x["ip"] == "127.0.0.2")["name"] == "Saturn 4 Ultra (mock)", r)
+            r = await post("/api/printers", {"printers": [{**first, "name": "Resin 1"}, {**two}]})
+            saved = json.load(open(cfgfile))
+            check("printer list persisted in config.json with all ports", [x["ip"] for x in saved["printers"]] == ["127.0.0.1", "127.0.0.2"] and set(saved["printers"][1]) >= {"id", "name", "ip", "printer_port", "video_port", "udp_port", "web_port"}, saved.get("printers"))
+            r = await post("/api/printers", {"printers": [{"name": "x", "ip": "not-an-ip"}]})
+            check("printer list rejects bad IP", not r["ok"], r)
+            r = await post("/api/printers", {"printers": [{**first}, {"name": "x", "ip": "127.0.0.3", "printer_port": 99999}]})
+            check("printer list rejects bad port", not r["ok"], r)
+            r = await post("/api/printers", {"printers": [{**first, "name": "Resin 1"}, {**two}, {"name": "Duplicate", "ip": "127.0.0.2", "printer_port": PORTS["printer"]}]})
+            check("duplicate IP addresses are allowed", r["ok"] and [x["ip"] for x in r["printers"]].count("127.0.0.2") == 2 and len({x["id"] for x in r["printers"]}) == 3, r)
+            r = await post("/api/printers/select", {"id": "nope"})
+            check("select refuses an unknown printer", not r["ok"], r)
+            r = await post("/api/printers/select", {"id": two["id"]})
+            check("select another printer", r["ok"] and r["active_printer"] == two["id"], r)
+
+            async def on_two():
+                _, x = await get("/api/state")
+                return x if x["printer_ip"] == "127.0.0.2" and x["connected"] and x["attributes"] else None
+            check("app connects to the newly selected printer", await wait_for(on_two, 15))
+            check("selection persisted in config.json", json.load(open(cfgfile))["active_printer"] == two["id"] and json.load(open(cfgfile))["printer_ip"] == "127.0.0.2")
+            _, c = await get("/api/config")
+            r = await post("/api/printers", {"printers": [x for x in c["printers"] if x["id"] == first["id"]]})
+            check("removing the active printer switches to the first one left", r["ok"] and r["switched"] and r["active_printer"] == first["id"], r)
+
+            async def on_one():
+                _, x = await get("/api/state")
+                return x if x["printer_ip"] == "127.0.0.1" and x["connected"] and x["attributes"] else None
+            check("app reconnects to the remaining printer", await wait_for(on_one, 15))
+            # delete every printer, then add one again
+            r = await post("/api/printers", {"printers": []})
+            check("every printer can be deleted", r["ok"] and r["printers"] == [] and r["active_printer"] == "" and r["switched"], r)
+            saved = json.load(open(cfgfile))
+            check("empty list is remembered in config.json", saved["printers"] == [] and saved["printers_configured"] is True and saved["printer_ip"] == "")
+
+            async def idle():
+                _, x = await get("/api/state")
+                return x if not x["connected"] and x["printer_ip"] == "" else None
+            check("with no printers the app disconnects and idles", await wait_for(idle, 10))
+            r = await post("/api/settings", {"render_folder": rdir})
+            check("settings (render folder) still save with no printer", r["ok"], r)
+            from saturn_control.config import load_config
+            check("config loads as 'no printer' after everything was deleted", load_config(cfgfile)["printer_ip"] == "" and load_config(cfgfile)["printers"] == [])
+            r = await post("/api/printers", {"printers": [{**first}]})
+            check("adding a printer again reconnects", r["ok"] and r["switched"] and r["active_printer"] == first["id"], r)
+            check("app connects to the re-added printer", await wait_for(on_one, 15))
+            r = await get("/")
+            check("page links carry a version so updates are never hidden by the cache", b"/static/app.js?v=" in r[1] and b"/static/style.css?v=" in r[1])
 
             # reconnect after printer dies
             mock.terminate(); mock.wait()

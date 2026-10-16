@@ -1,5 +1,4 @@
 {
-  "printer_ip": "192.168.0.189",
   "printer_port": 3030,
   "video_port": 3031,
   "udp_port": 3000,
@@ -9,7 +8,7 @@
   "open_browser": true,
   "auto_exit": true,
   "light_enabled": false,
-  "render_folder": "",
+  "render_folder": "C:\\",
   "keepalive_seconds": 12,
   "keepalive_timeout": 8
 }

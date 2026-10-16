@@ -482,9 +482,9 @@ async def amain(args):
     for a, port in ((app, args.port), (vapp, args.video_port)):
         r = web.AppRunner(a)
         await r.setup()
-        await web.TCPSite(r, "127.0.0.1", port).start()
+        await web.TCPSite(r, args.host, port).start()
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(Udp, local_addr=("127.0.0.1", args.udp_port))
+    await loop.create_datagram_endpoint(Udp, local_addr=(args.host, args.udp_port))
     print(f"Mock printer: ws/http :{args.port}, video :{args.video_port}, udp :{args.udp_port}, data {m.root}", flush=True)
     await asyncio.Event().wait()
 
@@ -495,6 +495,7 @@ if __name__ == "__main__":
     ap.add_argument("--video-port", type=int, default=3031)
     ap.add_argument("--udp-port", type=int, default=3000)
     ap.add_argument("--dir")
+    ap.add_argument("--host", default="127.0.0.1", help="address to listen on (0.0.0.0 lets tests reach it as 127.0.0.2)")
     ap.add_argument("--minimal", action="store_true")
     ap.add_argument("--rtsp-dead", action="store_true", help="advertise an unreachable RTSP camera URL")
     ap.add_argument("--light-unsupported", action="store_true")

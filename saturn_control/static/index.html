@@ -11,7 +11,7 @@
 <header>
   <div class="brand"><span class="logo"></span><span id="printerName">Saturn Control</span></div>
   <div class="hdr-status">
-    <span id="connDot" class="dot off"></span><span id="connText">Connecting…</span>
+    <span id="connDot" class="dot off"></span><button id="connBtn" class="conn-btn" title="Switch printer"><span id="connText">Connecting…</span> <span class="caret">▾</span></button><div id="printerMenu" class="pmenu hidden"></div>
     <span id="stateChip" class="chip">–</span>
   </div>
   <div class="hdr-actions">
@@ -99,6 +99,8 @@
         <div id="uploadBox" class="upload hidden">
           <div class="up-row"><b id="upName"></b><span id="upPhase"></span><button class="btn sm danger" id="upCancel">Cancel</button></div>
           <div class="bar"><div id="upBar" style="width:0%"></div><span id="upPct"></span></div>
+          <div class="up-speed" id="upSpeed"></div>
+          <div class="up-queue hidden" id="upQueue"></div>
         </div>
         <div id="dropzone" class="dropzone">Drop files here to upload to this printer</div>
         <div id="fileList" class="files"></div>
@@ -123,7 +125,7 @@
           <label>Time-lapse photography</label>
           <div class="row"><label class="switch"><input type="checkbox" id="tlSwitch"><span></span></label><span class="muted">Printer records a time-lapse of each print</span></div>
           <label>Find printers on the network</label>
-          <div class="row"><button class="btn" id="btnDiscover">Scan (UDP)</button><span class="muted" id="discoverOut"></span></div>
+          <div><button class="btn" id="btnDiscover">Scan (UDP)</button><div class="muted" id="discoverOut" style="margin-top:8px;user-select:text"></div></div>
         </div>
       </div>
       <div class="card">
@@ -202,11 +204,13 @@
         <div id="rnUploadBox" class="upload hidden">
           <div class="up-row"><b id="rnUpName"></b><span id="rnUpPhase"></span><button class="btn sm danger" id="rnUpCancel">Cancel</button></div>
           <div class="bar"><div id="rnUpBar" style="width:0%"></div><span id="rnUpPct"></span></div>
+          <div class="up-speed" id="rnUpSpeed"></div>
+          <div class="up-queue hidden" id="rnUpQueue"></div>
         </div>
         <div class="ex-wrap">
           <div class="ex-tree" id="rnTree"></div>
           <div class="ex-main">
-            <div class="ex-head" id="rnHead"><span data-sort="name">Name</span><span data-sort="mtime">Modified</span><span data-sort="size">Size</span><span></span></div>
+            <div class="ex-head rn" id="rnHead"><span data-sort="name">Name</span><span data-sort="up" title="Is a file with the same name and size already on the printer?">Uploaded</span><span data-sort="mtime">Modified</span><span data-sort="size">Size</span><span></span></div>
             <div id="rnList" class="ex-list"></div>
             <div id="rnInfo" class="muted ex-info"></div>
           </div>
