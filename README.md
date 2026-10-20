@@ -2,6 +2,8 @@
 
 A local web UI (Fluidd-style) for an Elegoo Saturn 4 Ultra, using Elegoo's SDCP v3.0.0 network protocol.
 
+<img width="1902" height="943" alt="Screenshot 2026-10-20 100408" src="https://github.com/user-attachments/assets/354f9f0c-d58f-457b-90a9-e5cc97fca794" />
+
 ## Run it (Windows)
 1. Install Python 3.9+ from python.org (tick "Add python.exe to PATH") if you don't have it.
 2. Double-click `start-saturn-control.bat` (right-click > Send to > Desktop for a shortcut).
